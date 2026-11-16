@@ -336,8 +336,9 @@ void setup() {
   digitalWrite(PIN_BUZZER, LOW);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, HIGH);
+  analogWrite(LCD_BL, 140);  // backlight about 55%: bright enough indoors, and the biggest heat source after Wi-Fi
 
+  setCpuFrequencyMhz(160);  // 240 MHz is not needed; 160 runs cooler and still leaves plenty of headroom
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL, 400000);
   gfx->begin();
@@ -443,4 +444,5 @@ void loop() {
     nextDraw = now + 200;  // 5 frames a second is plenty and leaves time for sampling
     drawScreen();
   }
+  delay(1);  // let the CPU idle between passes instead of spinning flat out (less heat)
 }
