@@ -39,7 +39,9 @@
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
 Arduino_GFX *panel = new Arduino_ST7789(bus, LCD_RST, 0 /* rotation */, true /* IPS */, 240, 280, 0, 20, 0, 20);
-Arduino_Canvas *gfx = new Arduino_Canvas(240, 280, panel);  // draw off-screen, then flush: no flicker
+Arduino_Canvas *canvas = new Arduino_Canvas(240, 280, panel);  // draw off-screen, then flush: no flicker
+Arduino_GFX *gfx = canvas;  // what we draw on: the canvas, or the panel directly if the canvas cannot start
+bool useCanvas = true;
 
 // ======================= rep detector (DoseLoop core) =======================
 #define DL_SAMPLE_HZ 50
@@ -300,7 +302,7 @@ void drawScreen() {
   }
   const char *hint = !mpuOk ? "Sensor not found" : setActive ? (reached ? "Dose reached: stop" : "Set in progress") : "Press BOOT to start";
   centered(hint, 252, 2, !mpuOk ? ALERT : setActive ? ACCENT : MUTED);
-  gfx->flush();
+  if (useCanvas) canvas->flush();
 }
 
 void setup() {
@@ -313,12 +315,20 @@ void setup() {
   analogWrite(LCD_BL, 140);  // backlight about 55%: less heat
 
   Serial.begin(115200);
+  delay(300);
+  send("HELLO,DOSELOOP,1");
   Wire.begin(I2C_SDA, I2C_SCL, 400000);
-  gfx->begin();
+  // The canvas needs 134 KB of memory; if it cannot get it, draw straight to the screen instead.
+  if (canvas->begin()) {
+    send("LCD,OK");
+  } else {
+    useCanvas = false;
+    gfx = panel;
+    send(panel->begin() ? "LCD,OK_DIRECT" : "WARN,LCD_INIT_FAILED");
+  }
 
   mpuOk = mpuInit();
   rd.reset(cfg);
-  send("HELLO,DOSELOOP,1");
   if (!mpuOk) send("WARN,MPU6050_NOT_FOUND");
   drawScreen();
 }
