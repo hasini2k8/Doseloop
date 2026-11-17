@@ -141,7 +141,14 @@ bool mpuOk = false, setActive = false;
 int targetReps = 10;
 char exercise[40] = "Bicep curl";
 uint8_t lastQuality = 0;
+uint16_t lastTempo = 0, lastRom = 0;
 uint32_t buzzUntil = 0;
+
+// Live sensor readings, shown on the screen all the time.
+float liveAx = 0, liveAy = 0, liveAz = 0;
+float liveTilt = 0;     // tilt of the sensor's X axis from vertical, degrees (smoothed)
+bool liveFresh = false; // a reading arrived in the last half second
+uint32_t lastReadMs = 0;
 
 void send(const char *line) {
   Serial.print(line);
@@ -187,6 +194,7 @@ void setStart() {
   rd.reset(cfg);
   setActive = true;
   lastQuality = 0;
+  lastTempo = lastRom = 0;
   send("SET,START");
   beep(80);
 }
@@ -227,27 +235,71 @@ void centered(const char *s, int y, int size, uint16_t color) {
   gfx->print(s);
 }
 
+// One accelerometer axis: small label, value in g, and a bar from the centre (-1 g .. +1 g).
+void axis(const char *label, float v, int x) {
+  char buf[12];
+  gfx->setTextSize(1);
+  gfx->setTextColor(MUTED);
+  gfx->setCursor(x, 186);
+  gfx->print(label);
+  snprintf(buf, sizeof(buf), "%+.2f", v);
+  gfx->setTextSize(2);
+  gfx->setTextColor(INK);
+  gfx->setCursor(x, 197);
+  gfx->print(buf);
+  int len = (int)(constrain(v, -1.0f, 1.0f) * 30);
+  gfx->fillRect(x, 216, 60, 4, TRACK);
+  if (len > 0) gfx->fillRect(x + 30, 216, len, 4, ACCENT);
+  else if (len < 0) gfx->fillRect(x + 30 + len, 216, -len, 4, ACCENT);
+}
+
 void drawScreen() {
-  char buf[32];
+  char buf[40];
   bool reached = targetReps && rd.count >= targetReps;
   gfx->fillScreen(BG);
-  centered(exercise, 22, 2, INK);
+  centered(exercise, 14, 2, INK);
 
-  snprintf(buf, sizeof(buf), "%u", rd.count);  // the count, large
-  centered(buf, 66, 9, reached ? GOOD : INK);
+  // Reps: the count, the dose and a progress bar.
+  snprintf(buf, sizeof(buf), "%u", rd.count);
+  centered(buf, 38, 7, reached ? GOOD : INK);
   snprintf(buf, sizeof(buf), "of %d reps", targetReps);
-  centered(buf, 144, 2, MUTED);
-
+  centered(buf, 92, 2, MUTED);
   int fill = targetReps ? min(200, (int)(200L * rd.count / targetReps)) : 0;
-  gfx->fillRoundRect(20, 172, 200, 10, 5, TRACK);
-  if (fill) gfx->fillRoundRect(20, 172, fill, 10, 5, reached ? GOOD : ACCENT);
+  gfx->fillRoundRect(20, 114, 200, 8, 4, TRACK);
+  if (fill) gfx->fillRoundRect(20, 114, fill, 8, 4, reached ? GOOD : ACCENT);
 
+  if (!mpuOk || !liveFresh) {
+    centered("No sensor data", 160, 2, ALERT);
+    centered("SDA GPIO11  SCL GPIO10", 186, 1, MUTED);
+  } else {
+    // Movement: during a set, how far the arm is from its resting position compared with
+    // the prescribed range (the green tick is half the range: a full rep must pass it).
+    // Outside a set, the plain tilt angle.
+    float move = setActive && rd.cal_n >= CAL_SAMPLES ? fabsf(rd.angle_f - rd.rest_deg) : liveTilt;
+    snprintf(buf, sizeof(buf), setActive ? "Moved %d deg" : "Tilt %d deg", (int)(move + 0.5f));
+    gfx->setTextSize(2);
+    gfx->setTextColor(INK);
+    gfx->setCursor(20, 136);
+    gfx->print(buf);
+    float full = setActive ? cfg.target_rom_deg : 180.0f;
+    int w = (int)(200 * constrain(move / full, 0.0f, 1.0f));
+    gfx->fillRoundRect(20, 158, 200, 12, 6, TRACK);
+    if (w) gfx->fillRoundRect(20, 158, max(w, 12), 12, 6, setActive && move >= VALID_FRAC * full ? GOOD : ACCENT);
+    if (setActive) gfx->fillRect(20 + (int)(200 * VALID_FRAC), 155, 2, 18, GOOD);
+
+    // Raw accelerometer, in g.
+    axis("X", liveAx, 20);
+    axis("Y", liveAy, 90);
+    axis("Z", liveAz, 160);
+  }
+
+  // Last rep: range, time and form score.
   if (lastQuality) {
-    snprintf(buf, sizeof(buf), "Form %u%%", lastQuality);
-    centered(buf, 200, 2, lastQuality >= 70 ? GOOD : ACCENT);
+    snprintf(buf, sizeof(buf), "%u deg  %.1fs  Form %u%%", lastRom, lastTempo / 1000.0f, lastQuality);
+    centered(buf, 232, 1 + (strlen(buf) <= 18), lastQuality >= 70 ? GOOD : ACCENT);
   }
   const char *hint = !mpuOk ? "Sensor not found" : setActive ? (reached ? "Dose reached: stop" : "Set in progress") : "Press BOOT to start";
-  centered(hint, 240, 2, !mpuOk ? ALERT : setActive ? ACCENT : MUTED);
+  centered(hint, 252, 2, !mpuOk ? ALERT : setActive ? ACCENT : MUTED);
   gfx->flush();
 }
 
@@ -311,10 +363,27 @@ void loop() {
     buzzUntil = 0;
   }
 
+  // Sensor missing: look for it again every 2 seconds, so fixing the wiring works without a reset.
+  static uint32_t nextRetry = 0;
+  if (!mpuOk && (int32_t)(now - nextRetry) >= 0) {
+    nextRetry = now + 2000;
+    if ((mpuOk = mpuInit())) send("WARN,MPU6050_FOUND");
+  }
+
   if ((int32_t)(now - nextSample) >= 0) {  // motion: 50 samples a second
     nextSample += 1000 / DL_SAMPLE_HZ;
     float ax, ay, az;
-    if (setActive && mpuOk && mpuRead(ax, ay, az)) {
+    bool got = mpuOk && mpuRead(ax, ay, az);
+    if (got) {  // live readings for the screen, in or out of a set
+      liveAx += 0.3f * (ax - liveAx);
+      liveAy += 0.3f * (ay - liveAy);
+      liveAz += 0.3f * (az - liveAz);
+      float tilt = atan2f(sqrtf(ay * ay + az * az), ax) * 57.29578f;
+      liveTilt += 0.3f * (tilt - liveTilt);
+      lastReadMs = now;
+    }
+    liveFresh = lastReadMs && now - lastReadMs < 500;
+    if (setActive && got) {
       Rep rep;
       RepEvent ev = rd.update(ax, ay, az, now, rep);
       char buf[48];
@@ -322,6 +391,8 @@ void loop() {
         snprintf(buf, sizeof(buf), "REP,%u,%u,%u,%u", rep.count, rep.tempo_ms, rep.rom_deg, rep.quality);
         send(buf);
         lastQuality = rep.quality;
+        lastTempo = rep.tempo_ms;
+        lastRom = rep.rom_deg;
         if (targetReps && rep.count == targetReps) beep(400);     // dose reached
         else if (targetReps && rep.count > targetReps) beep(60);  // past the dose
       } else if (ev == EV_PARTIAL) {
