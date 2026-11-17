@@ -1,5 +1,5 @@
 /*
- * DoseLoop wearable for the Waveshare ESP32-S3-LCD-1.69, MPU6050 only, single file.
+ * DoseLoop wearable for the Waveshare ESP32-S3-LCD-1.69 + MPU6050 + MAX30102, single file.
  *
  * Counts reps from an MPU6050 worn on the wrist, shows the count on the 1.69" screen, and
  * sends each rep over USB to the DoseLoop app's "Wearable" option (Chrome or Edge).
@@ -8,20 +8,28 @@
  *   MPU6050 VCC -> 3V3 (never 5V)   GND -> GND
  *   MPU6050 SDA -> GPIO11           SCL -> GPIO10
  *   MPU6050 AD0 -> GND (address 0x68). XDA, XCL, INT: not connected.
+ *   MAX30102 VIN -> 3V3, GND -> GND, SDA -> GPIO11, SCL -> GPIO10 (same pins as the MPU6050;
+ *   address 0x57, INT not connected).
  *   Do not use GPIO4-8 for anything: they drive the screen.
  *
  * Arduino IDE: board "ESP32S3 Dev Module", USB CDC On Boot: Enabled, Flash Size 16MB,
  *              Partition Scheme "16M Flash (3MB APP/9.9MB FATFS)" (not an "ESP SR" one).
- * Library: "GFX Library for Arduino" (moononournation). Nothing else to copy.
+ * Libraries: "GFX Library for Arduino" (moononournation) and "SparkFun MAX3010x Pulse and
+ * Proximity Sensor Library". Nothing else to copy. (The SparkFun library prints an
+ * "I2C_BUFFER_LENGTH redefined" warning on ESP32: harmless.)
+ * Tools -> PSRAM: OPI PSRAM (the screen buffer uses it).
  *
  * Serial (115200):  board -> app  HELLO,DOSELOOP,1 | SET,START | REP,<n>,<tempo_ms>,<rom_deg>,<quality>
- *                                 PART,<rom_deg> | SET,STOP,<reps>,<partials> | WARN,MPU6050_NOT_FOUND
+ *                                 PART,<rom_deg> | HR,<bpm> | SPO2,<percent> | WARN,HR_HIGH
+ *                                 SET,STOP,<reps>,<partials> | WARN,MPU6050_NOT_FOUND | WARN,MAX30102_NOT_FOUND
  *                   app -> board  EX,<name> | CFG,<rom_deg>,<tempo_ms>,<target_reps>,<hr_max> | START | STOP
  */
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
 #include <Arduino_GFX_Library.h>
+#include "MAX30105.h"
+#include "spo2_algorithm.h"
 
 // Board pins (Waveshare ESP32-S3-LCD-1.69 schematic, V2 boards).
 #define LCD_DC 4
@@ -152,6 +160,12 @@ float liveTilt = 0;     // tilt of the sensor's X axis from vertical, degrees (s
 bool liveFresh = false; // a reading arrived in the last half second
 uint32_t lastReadMs = 0;
 
+// Heart rate and blood oxygen (MAX30102).
+MAX30105 ox;
+bool oxOk = false, finger = false;
+int hr = 0, spo2 = 0;  // 0 = no reading yet
+int hrMax = 130;       // the app sends the participant's limit in CFG
+
 void send(const char *line) {
   Serial.print(line);
   Serial.print('\n');
@@ -192,6 +206,66 @@ bool mpuRead(float &ax, float &ay, float &az) {
   return true;
 }
 
+// MAX30102: 25 samples a second; heart rate and SpO2 from the last 4 seconds, recomputed
+// every second. Only readings the algorithm marks valid are kept, and the median of the
+// last 4 is shown, which steadies the number.
+#define OX_N 100
+uint32_t irBuf[OX_N], redBuf[OX_N];
+int oxCount = 0, oxNew = 0;
+int hrHist[4], spHist[4], hrN = 0, spN = 0;
+
+int median4(const int *v, int n) {
+  int t[4];
+  for (int i = 0; i < n; i++) t[i] = v[i];
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++)
+      if (t[j] < t[i]) { int x = t[i]; t[i] = t[j]; t[j] = x; }
+  return n ? t[n / 2] : 0;
+}
+
+void oxSetup() {
+  if (!(oxOk = ox.begin(Wire, I2C_SPEED_FAST))) return;
+  ox.setup(60 /* LED level */, 4 /* averaging */, 2 /* red + IR */, 100 /* samples/s */, 411 /* pulse width */, 4096 /* range */);
+}
+
+void oxPoll() {
+  if (!oxOk) return;
+  ox.check();
+  while (ox.available()) {
+    if (oxCount < OX_N) oxCount++;
+    memmove(irBuf, irBuf + 1, (OX_N - 1) * sizeof(uint32_t));
+    memmove(redBuf, redBuf + 1, (OX_N - 1) * sizeof(uint32_t));
+    irBuf[OX_N - 1] = ox.getFIFOIR();
+    redBuf[OX_N - 1] = ox.getFIFORed();
+    ox.nextSample();
+    oxNew++;
+  }
+  if (oxCount < OX_N || oxNew < 25) return;
+  oxNew = 0;
+  uint64_t sum = 0;
+  for (int i = 0; i < OX_N; i++) sum += irBuf[i];
+  finger = sum / OX_N > 50000;  // much less infrared coming back means nothing is on the sensor
+  if (!finger) {
+    hr = spo2 = hrN = spN = 0;
+    return;
+  }
+  int32_t s, h;
+  int8_t sValid, hValid;
+  maxim_heart_rate_and_oxygen_saturation(irBuf, OX_N, redBuf, &s, &sValid, &h, &hValid);
+  if (hValid && h >= 40 && h <= 200) {
+    memmove(hrHist + 1, hrHist, 3 * sizeof(int));
+    hrHist[0] = h;
+    if (hrN < 4) hrN++;
+    hr = median4(hrHist, hrN);
+  }
+  if (sValid && s >= 70 && s <= 100) {
+    memmove(spHist + 1, spHist, 3 * sizeof(int));
+    spHist[0] = s;
+    if (spN < 4) spN++;
+    spo2 = median4(spHist, spN);
+  }
+}
+
 void setStart() {
   rd.reset(cfg);
   setActive = true;
@@ -209,7 +283,7 @@ void setStop() {
 }
 
 void handleLine(const char *line) {
-  unsigned rom, tempo, reps, hr;
+  unsigned rom, tempo, reps, hrLimit;
   if (strncmp(line, "EX,", 3) == 0) {  // exercise name, shown on the screen
     strncpy(exercise, line + 3, sizeof(exercise) - 1);
     exercise[sizeof(exercise) - 1] = 0;
@@ -217,10 +291,11 @@ void handleLine(const char *line) {
     if (!setActive) setStart();
   } else if (strcmp(line, "STOP") == 0) {
     if (setActive) setStop();
-  } else if (sscanf(line, "CFG,%u,%u,%u,%u", &rom, &tempo, &reps, &hr) == 4 && rom >= 5 && rom <= 180 && tempo >= 300 && tempo <= 10000 && reps <= 500) {
+  } else if (sscanf(line, "CFG,%u,%u,%u,%u", &rom, &tempo, &reps, &hrLimit) == 4 && rom >= 5 && rom <= 180 && tempo >= 300 && tempo <= 10000 && reps <= 500) {
     cfg.target_rom_deg = rom;
     cfg.target_tempo_ms = tempo;
     targetReps = reps;
+    hrMax = hrLimit;
   }
 }
 
@@ -242,17 +317,17 @@ void axis(const char *label, float v, int x) {
   char buf[12];
   gfx->setTextSize(1);
   gfx->setTextColor(MUTED);
-  gfx->setCursor(x, 186);
+  gfx->setCursor(x, 194);
   gfx->print(label);
   snprintf(buf, sizeof(buf), "%+.2f", v);
   gfx->setTextSize(2);
   gfx->setTextColor(INK);
-  gfx->setCursor(x, 197);
+  gfx->setCursor(x, 204);
   gfx->print(buf);
   int len = (int)(constrain(v, -1.0f, 1.0f) * 30);
-  gfx->fillRect(x, 216, 60, 4, TRACK);
-  if (len > 0) gfx->fillRect(x + 30, 216, len, 4, ACCENT);
-  else if (len < 0) gfx->fillRect(x + 30 + len, 216, -len, 4, ACCENT);
+  gfx->fillRect(x, 223, 60, 4, TRACK);
+  if (len > 0) gfx->fillRect(x + 30, 223, len, 4, ACCENT);
+  else if (len < 0) gfx->fillRect(x + 30 + len, 223, -len, 4, ACCENT);
 }
 
 void drawScreen() {
@@ -270,9 +345,28 @@ void drawScreen() {
   gfx->fillRoundRect(20, 114, 200, 8, 4, TRACK);
   if (fill) gfx->fillRoundRect(20, 114, fill, 8, 4, reached ? GOOD : ACCENT);
 
+  // Heart rate and oxygen.
+  bool hrHigh = hrMax && hr > hrMax;
+  if (!oxOk) {
+    centered("Pulse sensor not found", 136, 1, ALERT);
+  } else if (!finger) {
+    centered("Put a finger on the pulse sensor", 136, 1, MUTED);
+  } else {
+    gfx->fillCircle(28, 139, 6, ALERT);
+    snprintf(buf, sizeof(buf), hr ? "%d bpm" : "-- bpm", hr);
+    gfx->setTextSize(2);
+    gfx->setTextColor(hrHigh ? ALERT : INK);
+    gfx->setCursor(40, 132);
+    gfx->print(buf);
+    snprintf(buf, sizeof(buf), spo2 ? "O2 %d%%" : "O2 --", spo2);
+    gfx->setTextColor(spo2 && spo2 < 90 ? ALERT : INK);
+    gfx->setCursor(144, 132);
+    gfx->print(buf);
+  }
+
   if (!mpuOk || !liveFresh) {
-    centered("No sensor data", 160, 2, ALERT);
-    centered("SDA GPIO11  SCL GPIO10", 186, 1, MUTED);
+    centered("No motion data", 172, 2, ALERT);
+    centered("SDA GPIO11  SCL GPIO10", 198, 1, MUTED);
   } else {
     // Movement: during a set, how far the arm is from its resting position compared with
     // the prescribed range (the green tick is half the range: a full rep must pass it).
@@ -281,13 +375,13 @@ void drawScreen() {
     snprintf(buf, sizeof(buf), setActive ? "Moved %d deg" : "Tilt %d deg", (int)(move + 0.5f));
     gfx->setTextSize(2);
     gfx->setTextColor(INK);
-    gfx->setCursor(20, 136);
+    gfx->setCursor(20, 156);
     gfx->print(buf);
     float full = setActive ? cfg.target_rom_deg : 180.0f;
     int w = (int)(200 * constrain(move / full, 0.0f, 1.0f));
-    gfx->fillRoundRect(20, 158, 200, 12, 6, TRACK);
-    if (w) gfx->fillRoundRect(20, 158, max(w, 12), 12, 6, setActive && move >= VALID_FRAC * full ? GOOD : ACCENT);
-    if (setActive) gfx->fillRect(20 + (int)(200 * VALID_FRAC), 155, 2, 18, GOOD);
+    gfx->fillRoundRect(20, 176, 200, 10, 5, TRACK);
+    if (w) gfx->fillRoundRect(20, 176, max(w, 10), 10, 5, setActive && move >= VALID_FRAC * full ? GOOD : ACCENT);
+    if (setActive) gfx->fillRect(20 + (int)(200 * VALID_FRAC), 173, 2, 16, GOOD);
 
     // Raw accelerometer, in g.
     axis("X", liveAx, 20);
@@ -298,10 +392,10 @@ void drawScreen() {
   // Last rep: range, time and form score.
   if (lastQuality) {
     snprintf(buf, sizeof(buf), "%u deg  %.1fs  Form %u%%", lastRom, lastTempo / 1000.0f, lastQuality);
-    centered(buf, 232, 1 + (strlen(buf) <= 18), lastQuality >= 70 ? GOOD : ACCENT);
+    centered(buf, 238, 1, lastQuality >= 70 ? GOOD : ACCENT);
   }
-  const char *hint = !mpuOk ? "Sensor not found" : setActive ? (reached ? "Dose reached: stop" : "Set in progress") : "Press BOOT to start";
-  centered(hint, 252, 2, !mpuOk ? ALERT : setActive ? ACCENT : MUTED);
+  const char *hint = hrHigh ? "Heart rate high: rest" : !mpuOk ? "Sensor not found" : setActive ? (reached ? "Dose reached: stop" : "Set in progress") : "Press BOOT to start";
+  centered(hint, 256, 2, hrHigh || !mpuOk ? ALERT : setActive ? ACCENT : MUTED);
   if (useCanvas) canvas->flush();
 }
 
@@ -328,8 +422,10 @@ void setup() {
   }
 
   mpuOk = mpuInit();
+  oxSetup();
   rd.reset(cfg);
   if (!mpuOk) send("WARN,MPU6050_NOT_FOUND");
+  if (!oxOk) send("WARN,MAX30102_NOT_FOUND");
   drawScreen();
 }
 
@@ -378,6 +474,31 @@ void loop() {
   if (!mpuOk && (int32_t)(now - nextRetry) >= 0) {
     nextRetry = now + 2000;
     if ((mpuOk = mpuInit())) send("WARN,MPU6050_FOUND");
+  }
+  static uint32_t nextOxRetry = 0;
+  if (!oxOk && (int32_t)(now - nextOxRetry) >= 0) {
+    nextOxRetry = now + 3000;
+    oxSetup();
+    if (oxOk) send("WARN,MAX30102_FOUND");
+  }
+
+  // Heart rate and SpO2: sent every 2 seconds while a finger is on the sensor.
+  static uint32_t lastHrSent = 0, lastWarn = 0;
+  oxPoll();
+  if (finger && hr && now - lastHrSent >= 2000) {
+    char b[24];
+    lastHrSent = now;
+    snprintf(b, sizeof(b), "HR,%d", hr);
+    send(b);
+    if (spo2) {
+      snprintf(b, sizeof(b), "SPO2,%d", spo2);
+      send(b);
+    }
+    if (hrMax && hr > hrMax && now - lastWarn >= 10000) {
+      lastWarn = now;
+      send("WARN,HR_HIGH");
+      beep(600);
+    }
   }
 
   if ((int32_t)(now - nextSample) >= 0) {  // motion: 50 samples a second
