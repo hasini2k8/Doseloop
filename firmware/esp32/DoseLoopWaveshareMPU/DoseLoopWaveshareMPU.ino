@@ -15,7 +15,7 @@
  * Arduino IDE: board "ESP32S3 Dev Module", USB CDC On Boot: Enabled, Flash Size 16MB,
  *              Partition Scheme "16M Flash (3MB APP/9.9MB FATFS)" (not an "ESP SR" one).
  * Libraries: "GFX Library for Arduino" (moononournation) and "SparkFun MAX3010x Pulse and
- * Proximity Sensor Library". Nothing else to copy. (The SparkFun library prints an
+ * Proximity Sensor Library" (used only to read the sensor). Nothing else to copy. (The SparkFun library prints an
  * "I2C_BUFFER_LENGTH redefined" warning on ESP32: harmless.)
  * Tools -> PSRAM: OPI PSRAM (the screen buffer uses it).
  *
@@ -29,7 +29,6 @@
 #include <math.h>
 #include <Arduino_GFX_Library.h>
 #include "MAX30105.h"
-#include "spo2_algorithm.h"
 
 // Board pins (Waveshare ESP32-S3-LCD-1.69 schematic, V2 boards).
 #define LCD_DC 4
@@ -144,6 +143,182 @@ struct RepDetector {
   }
 };
 
+// ======================= pulse detector =======================
+// Heart rate and SpO2 from MAX30102 red/IR samples at 100 samples a second.
+//
+// Finds each heartbeat as a peak in the filtered infrared signal, ignores stretches where the
+// finger moves, rejects beats that do not fit the recent rhythm, and reports the median of
+// recent beat-to-beat intervals. So the rate can be any value (72, 73, 74 ...) rather than
+// the few steps the SparkFun/Maxim example produces. SpO2 uses the ratio of the red and
+// infrared pulse sizes with Maxim's calibration curve.
+//
+// Same code as firmware/esp32/pulse_detector.h, which is tested on a computer
+// (firmware/test/test_pulse.cpp).
+
+struct PulseDetector {
+  static const int HIST = 6;
+  static constexpr float FINGER_IR = 50000;  // below this nothing is on the sensor
+
+  // Outputs.
+  int bpm = 0;    // 0 until 3 consistent beats
+  int spo2 = 0;   // 0 until 3 beats with a usable red/IR ratio
+  bool finger = false;
+  bool moving = false;  // the last second was disturbed by movement
+
+  // Filter state.
+  float dcIr = 0, dcRed = 0;      // slow level (about 1 s), the "DC" in the SpO2 ratio
+  float baseIr = 0, baseRed = 0;  // faster baseline (about 0.25 s): follows pressure changes
+  float lpIr = 0, lpRed = 0, env = 0;
+  uint16_t settle = 0;
+  bool above = false;
+  float peakVal = 0;
+  uint32_t peakT = 0, lastPeakT = 0, quietFrom = 0;
+  // Sums over the current beat, for SpO2 with any straight-line drift removed:
+  // x = infrared pulse, y = red pulse, k = sample number within the beat.
+  float sX = 0, sY = 0, sK = 0, sXX = 0, sXY = 0, sKK = 0, sXK = 0, sYK = 0;
+  uint16_t beatN = 0;
+  uint16_t ibi[HIST] = {0};
+  uint8_t nIbi = 0, rejects = 0;
+  float amp[5] = {0};             // recent beat sizes, to recognise movement
+  uint8_t nAmp = 0;
+  float ratio[5] = {0};
+  uint8_t nRatio = 0;
+
+  void reset() { *this = PulseDetector(); }
+  void clearBeat() { sX = sY = sK = sXX = sXY = sKK = sXK = sYK = 0; beatN = 0; }
+
+  template <class T>
+  static T median(const T *v, int n) {
+    T s[8];
+    for (int i = 0; i < n; i++) s[i] = v[i];
+    for (int i = 1; i < n; i++)
+      for (int j = i; j > 0 && s[j] < s[j - 1]; j--) {
+        T x = s[j];
+        s[j] = s[j - 1];
+        s[j - 1] = x;
+      }
+    return n % 2 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+  }
+
+  // One sample. Returns true when a heartbeat is accepted.
+  bool update(uint32_t ir, uint32_t red, uint32_t t_ms) {
+    if (ir < FINGER_IR) {
+      if (finger) reset();
+      return false;
+    }
+    if (!finger) {  // finger just arrived: start the filters at its level
+      finger = true;
+      dcIr = baseIr = ir;
+      dcRed = baseRed = red;
+    }
+    dcIr += 0.01f * (ir - dcIr);
+    dcRed += 0.01f * (red - dcRed);
+    baseIr += 0.04f * (ir - baseIr);
+    baseRed += 0.04f * (red - baseRed);
+    // Inverted: blood arriving with each beat absorbs more light, so less comes back.
+    lpIr += 0.3f * ((baseIr - ir) - lpIr);  // and smoothed above about 5 Hz
+    lpRed += 0.3f * ((baseRed - red) - lpRed);
+    if (settle < 150) {  // 1.5 s for the filters to settle after the finger arrives
+      settle++;
+      env = fabsf(lpIr);
+      return false;
+    }
+
+    // Movement: a swing far bigger than recent heartbeats. Ignore the next 0.6 s and do not
+    // count the gap as a long beat.
+    float ampMed = nAmp >= 3 ? median(amp, nAmp) : 0;
+    if (ampMed > 0 && fabsf(lpIr) > 1.5f * ampMed) {
+      quietFrom = t_ms + 600;
+      moving = true;
+      above = false;
+      lastPeakT = 0;
+      clearBeat();
+      return false;
+    }
+    if ((int32_t)(t_ms - quietFrom) < 0) return false;
+    if ((int32_t)(t_ms - quietFrom) > 1000) moving = false;
+
+    float k = beatN++;
+    sX += lpIr; sY += lpRed; sK += k;
+    sXX += lpIr * lpIr; sXY += lpIr * lpRed; sKK += k * k; sXK += lpIr * k; sYK += lpRed * k;
+
+    // Envelope of the pulse size, falling by half in about 1.4 s; a beat must reach 40% of it.
+    env *= 0.995f;
+    if (fabsf(lpIr) > env) env = fabsf(lpIr);
+    float th = 0.4f * env;
+
+    if (!above) {
+      if (lpIr > th && (!lastPeakT || t_ms - lastPeakT > 330)) {  // at most about 180 bpm
+        above = true;
+        peakVal = lpIr;
+        peakT = t_ms;
+      }
+      return false;
+    }
+    if (lpIr > peakVal) {
+      peakVal = lpIr;
+      peakT = t_ms;
+    }
+    if (lpIr > 0) return false;
+    above = false;  // back below the middle: the peak just passed was a beat
+    return beat();
+  }
+
+  bool beat() {
+    uint32_t prev = lastPeakT;
+    lastPeakT = peakT;
+    // Covariances over the beat with the mean and a straight-line trend removed.
+    float n = beatN, eIr = 0, eRI = 0;
+    if (n > 10) {
+      float cXX = sXX - sX * sX / n, cXY = sXY - sX * sY / n, cKK = sKK - sK * sK / n;
+      float cXK = sXK - sX * sK / n, cYK = sYK - sY * sK / n;
+      eIr = cXX - cXK * cXK / cKK;
+      eRI = cXY - cXK * cYK / cKK;
+    }
+    clearBeat();
+    // Remember the beat size (for movement detection) even before the rhythm is known.
+    for (int k = 4; k > 0; k--) amp[k] = amp[k - 1];
+    amp[0] = peakVal;
+    if (nAmp < 5) nAmp++;
+    if (!prev) return false;
+    uint32_t i = peakT - prev;
+    if (i < 333 || i > 1500) {  // outside 40-180 bpm: a gap or a glitch, start again
+      nIbi = 0;
+      return false;
+    }
+    if (nIbi >= 3) {
+      uint16_t med = median(ibi, nIbi);
+      if (fabsf((float)i - med) > 0.25f * med) {  // does not fit the rhythm
+        if (++rejects >= 3) nIbi = rejects = 0;   // three in a row: the rate really changed
+        return false;
+      }
+    }
+    rejects = 0;
+    for (int k = HIST - 1; k > 0; k--) ibi[k] = ibi[k - 1];
+    ibi[0] = (uint16_t)i;
+    if (nIbi < HIST) nIbi++;
+    if (nIbi >= 3) bpm = (int)(60000.0f / median(ibi, nIbi) + 0.5f);
+
+    // SpO2 from the ratio of ratios R = (red AC / red DC) / (IR AC / IR DC), with AC measured
+    // as how strongly the red pulse follows the infrared one over the whole beat: sensor
+    // noise in the weaker red signal averages out instead of inflating its size.
+    if (eIr > 0 && eRI > 0 && dcIr > 0 && dcRed > 0) {
+      float R = (eRI / eIr) * dcIr / dcRed;
+      if (R > 0.2f && R < 1.8f) {
+        for (int k = 4; k > 0; k--) ratio[k] = ratio[k - 1];
+        ratio[0] = R;
+        if (nRatio < 5) nRatio++;
+        if (nRatio >= 3) {
+          float r = median(ratio, nRatio);
+          float s = -45.060f * r * r + 30.354f * r + 94.845f;  // Maxim's calibration
+          spo2 = s > 100 ? 100 : (s < 70 ? 0 : (int)(s + 0.5f));
+        }
+      }
+    }
+    return true;
+  }
+};
+
 // ======================= sketch =======================
 RepDetector rd;
 RepConfig cfg;
@@ -206,64 +381,30 @@ bool mpuRead(float &ax, float &ay, float &az) {
   return true;
 }
 
-// MAX30102: 25 samples a second; heart rate and SpO2 from the last 4 seconds, recomputed
-// every second. Only readings the algorithm marks valid are kept, and the median of the
-// last 4 is shown, which steadies the number.
-#define OX_N 100
-uint32_t irBuf[OX_N], redBuf[OX_N];
-int oxCount = 0, oxNew = 0;
-int hrHist[4], spHist[4], hrN = 0, spN = 0;
-
-int median4(const int *v, int n) {
-  int t[4];
-  for (int i = 0; i < n; i++) t[i] = v[i];
-  for (int i = 0; i < n; i++)
-    for (int j = i + 1; j < n; j++)
-      if (t[j] < t[i]) { int x = t[i]; t[i] = t[j]; t[j] = x; }
-  return n ? t[n / 2] : 0;
-}
+// MAX30102: 400 samples a second averaged in fours = 100 a second, read from the sensor's
+// buffer and fed to the pulse detector with their own timing (10 ms apart), so the screen
+// drawing cannot distort the beat intervals.
+PulseDetector pulse;
+uint32_t oxT = 0;
+uint32_t lastIr = 0, lastRed = 0;  // latest raw readings, for the status line
 
 void oxSetup() {
   if (!(oxOk = ox.begin(Wire, I2C_SPEED_FAST))) return;
-  ox.setup(60 /* LED level */, 4 /* averaging */, 2 /* red + IR */, 100 /* samples/s */, 411 /* pulse width */, 4096 /* range */);
+  ox.setup(60 /* LED level */, 4 /* averaging */, 2 /* red + IR */, 400 /* samples/s */, 411 /* pulse width */, 4096 /* range */);
 }
 
 void oxPoll() {
   if (!oxOk) return;
   ox.check();
   while (ox.available()) {
-    if (oxCount < OX_N) oxCount++;
-    memmove(irBuf, irBuf + 1, (OX_N - 1) * sizeof(uint32_t));
-    memmove(redBuf, redBuf + 1, (OX_N - 1) * sizeof(uint32_t));
-    irBuf[OX_N - 1] = ox.getFIFOIR();
-    redBuf[OX_N - 1] = ox.getFIFORed();
+    lastIr = ox.getFIFOIR();
+    lastRed = ox.getFIFORed();
+    pulse.update(lastIr, lastRed, oxT += 10);
     ox.nextSample();
-    oxNew++;
   }
-  if (oxCount < OX_N || oxNew < 25) return;
-  oxNew = 0;
-  uint64_t sum = 0;
-  for (int i = 0; i < OX_N; i++) sum += irBuf[i];
-  finger = sum / OX_N > 50000;  // much less infrared coming back means nothing is on the sensor
-  if (!finger) {
-    hr = spo2 = hrN = spN = 0;
-    return;
-  }
-  int32_t s, h;
-  int8_t sValid, hValid;
-  maxim_heart_rate_and_oxygen_saturation(irBuf, OX_N, redBuf, &s, &sValid, &h, &hValid);
-  if (hValid && h >= 40 && h <= 200) {
-    memmove(hrHist + 1, hrHist, 3 * sizeof(int));
-    hrHist[0] = h;
-    if (hrN < 4) hrN++;
-    hr = median4(hrHist, hrN);
-  }
-  if (sValid && s >= 70 && s <= 100) {
-    memmove(spHist + 1, spHist, 3 * sizeof(int));
-    spHist[0] = s;
-    if (spN < 4) spN++;
-    spo2 = median4(spHist, spN);
-  }
+  finger = pulse.finger;
+  hr = pulse.bpm;
+  spo2 = pulse.spo2;
 }
 
 void setStart() {
@@ -351,6 +492,10 @@ void drawScreen() {
     centered("Pulse sensor not found", 136, 1, ALERT);
   } else if (!finger) {
     centered("Put a finger on the pulse sensor", 136, 1, MUTED);
+  } else if (!hr && pulse.moving) {
+    centered("Hold your finger still", 136, 1, ACCENT);
+  } else if (!hr) {
+    centered("Reading pulse...", 136, 1, MUTED);
   } else {
     gfx->fillCircle(28, 139, 6, ALERT);
     snprintf(buf, sizeof(buf), hr ? "%d bpm" : "-- bpm", hr);
@@ -531,6 +676,19 @@ void loop() {
         send(buf);
       }
     }
+  }
+
+  // Status line once a second, so the Serial Monitor always shows the sensors working.
+  // (The DoseLoop app ignores it.) ir/red are the raw light readings: about 50000 or more
+  // means a finger is on the pulse sensor.
+  static uint32_t nextStatus = 0;
+  if ((int32_t)(now - nextStatus) >= 0) {
+    nextStatus = now + 1000;
+    char st[160];
+    snprintf(st, sizeof(st), "DATA,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,reps=%u",
+             mpuOk ? "ok" : "missing", (int)(liveTilt + 0.5f), liveAx, liveAy, liveAz, oxOk ? "ok" : "missing",
+             (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, rd.count);
+    send(st);
   }
 
   if ((int32_t)(now - nextDraw) >= 0) {
