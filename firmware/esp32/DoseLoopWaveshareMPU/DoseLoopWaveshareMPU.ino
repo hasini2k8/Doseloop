@@ -1,7 +1,7 @@
 /*
- * DoseLoop wearable for the Waveshare ESP32-S3-LCD-1.69 + MPU6050 + MAX30102, single file.
+ * DoseLoop wearable for the Waveshare ESP32-S3-LCD-1.47 + MPU6050 + MAX30102, single file.
  *
- * Counts reps from an MPU6050 worn on the wrist, shows the count on the 1.69" screen, and
+ * Counts reps from an MPU6050 worn on the wrist, shows the count on the 1.47" screen, and
  * sends each rep over USB to the DoseLoop app's "Wearable" option (Chrome or Edge).
  *
  * Wiring (the board's I2C header, shared with its onboard IMU and clock):
@@ -10,7 +10,7 @@
  *   MPU6050 AD0 -> GND (address 0x68). XDA, XCL, INT: not connected.
  *   MAX30102 VIN -> 3V3, GND -> GND, SDA -> GPIO11, SCL -> GPIO10 (same pins as the MPU6050;
  *   address 0x57, INT not connected).
- *   Do not use GPIO4-8 for anything: they drive the screen.
+ *   Do not use GPIO39-42, 45 or 48 (screen), 38 (RGB LED) or 14-18, 21 (SD card).
  *
  * Arduino IDE: board "ESP32S3 Dev Module", USB CDC On Boot: Enabled, Flash Size 16MB,
  *              Partition Scheme "16M Flash (3MB APP/9.9MB FATFS)" (not an "ESP SR" one).
@@ -33,6 +33,7 @@
 #include <Wire.h>
 #include <math.h>
 #include <WiFi.h>
+#include <time.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Arduino_GFX_Library.h>
@@ -46,23 +47,22 @@ const char *WIFI_PASS = "";
 const char *DOSELOOP_URL = "https://doseloop-tau.vercel.app";
 volatile int wifiLastCode = 0;  // last HTTP status (200 = the website got it); <0 = network error
 
-// Board pins (Waveshare ESP32-S3-LCD-1.69 schematic, V2 boards).
-#define LCD_DC 4
-#define LCD_CS 5
-#define LCD_SCK 6
-#define LCD_MOSI 7
-#define LCD_RST 8
-#define LCD_BL 15
-#define I2C_SDA 11
+// Board pins: Waveshare ESP32-S3-LCD-1.47 (from Waveshare's pin table).
+#define LCD_MOSI 45
+#define LCD_SCK 40
+#define LCD_CS 42
+#define LCD_DC 41
+#define LCD_RST 39
+#define LCD_BL 48
+#define PIN_RGB 38     // onboard RGB LED: flashes instead of a buzzer
+#define I2C_SDA 11     // sensors (free header pins)
 #define I2C_SCL 10
 #define PIN_BUTTON 0   // BOOT button: start / stop a set
-#define PIN_BUZZER 42  // onboard buzzer (older boards: 33)
-#define PIN_SYS_EN 41  // keeps the board on from its battery (older boards: 35)
 #define MPU 0x68
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
-Arduino_GFX *panel = new Arduino_ST7789(bus, LCD_RST, 0 /* rotation */, true /* IPS */, 240, 280, 0, 20, 0, 20);
-Arduino_Canvas *canvas = new Arduino_Canvas(240, 280, panel);  // draw off-screen, then flush: no flicker
+Arduino_GFX *panel = new Arduino_ST7789(bus, LCD_RST, 0 /* rotation */, true /* IPS */, 172, 320, 34, 0, 34, 0);
+Arduino_Canvas *canvas = new Arduino_Canvas(172, 320, panel);  // draw off-screen, then flush: no flicker
 Arduino_GFX *gfx = canvas;  // what we draw on: the canvas, or the panel directly if the canvas cannot start
 bool useCanvas = true;
 
@@ -160,55 +160,59 @@ struct RepDetector {
 };
 
 // ======================= pulse detector =======================
-// Heart rate and SpO2 from MAX30102 red/IR samples at 100 samples a second.
+// Heart rate and SpO2 from MAX30102 red/IR samples (about 100 a second).
 //
-// Finds each heartbeat as a peak in the filtered infrared signal, ignores stretches where the
-// finger moves, rejects beats that do not fit the recent rhythm, and reports the median of
-// recent beat-to-beat intervals. So the rate can be any value (72, 73, 74 ...) rather than
-// the few steps the SparkFun/Maxim example produces. SpO2 uses the ratio of the red and
-// infrared pulse sizes with Maxim's calibration curve.
+// Heart rate comes from the repeating rhythm of the last 8 seconds of the infrared signal
+// (autocorrelation), not from picking individual peaks: a real pulse wave has a second,
+// smaller bump after each beat, and peak picking counts it as an extra beat (reading double).
+// Once a second the detector asks "after what delay does this signal best repeat itself?";
+// that delay is one heartbeat. A clear repeat also tells it the reading is trustworthy, so
+// movement, pressing and an empty sensor give no number rather than a wrong one.
+//
+// SpO2 comes from how strongly the red signal pulses compared with the infrared one over the
+// same 8 seconds (the "ratio of ratios"), mapped with Maxim's calibration curve.
 //
 // Same code as firmware/esp32/pulse_detector.h, which is tested on a computer
 // (firmware/test/test_pulse.cpp).
 
 struct PulseDetector {
-  static const int HIST = 6;
-  static constexpr float FINGER_IR = 50000;   // below this nothing is on the sensor
+  static constexpr float FINGER_IR = 10000;   // below this nothing is on the sensor (empty reads ~1,300)
   static constexpr float SATURATED = 250000;  // above this the sensor is flooded (bright light)
-  // A real pulse changes the light by roughly 0.3-2%. Sensor noise on an empty but bright
-  // sensor is far smaller, so peaks under 0.08% of the level are not heartbeats.
-  static constexpr float MIN_PULSE = 0.0008f;
-  static const uint32_t NO_PULSE_MS = 4000;    // light but no pulse for this long: no finger
+  static const int N = 800;                   // 8 s window at 100 samples/s
+  static const int MIN_N = 500;               // first estimate after 5 s
+  static constexpr float MIN_QUALITY = 0.45f; // rhythm strength needed to report (0-1)
+  // A real pulse changes the light by roughly 0.1-2%. Below this it is sensor noise.
+  static constexpr float MIN_PULSE = 0.0004f;
+  static const uint32_t NO_PULSE_MS = 6000;   // light but no pulse for this long: no finger
 
   // Outputs.
-  int bpm = 0;    // 0 until 3 consistent beats
-  int spo2 = 0;   // 0 until 3 beats with a usable red/IR ratio
+  int bpm = 0;           // 0 until a clear rhythm is found
+  int spo2 = 0;          // 0 until a clear rhythm is found
   bool finger = false;   // something is on the sensor AND it has a pulse
   bool contact = false;  // enough light comes back (a finger, or just a reflection)
-  bool moving = false;  // the last second was disturbed by movement
+  bool moving = false;   // light changing but no clear rhythm: movement or pressing
+  float quality = 0;     // rhythm strength of the last estimate, 0-1
 
-  // Filter state.
-  float dcIr = 0, dcRed = 0;      // slow level (about 1 s), the "DC" in the SpO2 ratio
-  float baseIr = 0, baseRed = 0;  // faster baseline (about 0.25 s): follows pressure changes
-  float lpIr = 0, lpRed = 0, env = 0;
-  uint16_t settle = 0;
-  bool above = false;
-  float peakVal = 0;
-  uint32_t peakT = 0, lastPeakT = 0, quietFrom = 0;
-  uint32_t contactT = 0, pulseT = 0;  // when contact began; the last pulse-sized peak
-  // Sums over the current beat, for SpO2 with any straight-line drift removed:
-  // x = infrared pulse, y = red pulse, k = sample number within the beat.
-  float sX = 0, sY = 0, sK = 0, sXX = 0, sXY = 0, sKK = 0, sXK = 0, sYK = 0;
-  uint16_t beatN = 0;
-  uint16_t ibi[HIST] = {0};
-  uint8_t nIbi = 0, rejects = 0;
-  float amp[5] = {0};             // recent beat sizes, to recognise movement
-  uint8_t nAmp = 0;
-  float ratio[5] = {0};
-  uint8_t nRatio = 0;
+  // State.
+  float dcIr = 0, dcRed = 0, baseIr = 0, baseRed = 0, lpIr = 0, lpRed = 0;
+  float x[N], y[N];      // filtered infrared and red; the newest is at head-1
+  float cx[N], cy[N];    // the window being analysed, with movement bursts removed
+  uint32_t tStamp[N];
+  int head = 0, count = 0, sinceEstimate = 0;
+  uint32_t contactT = 0, pulseT = 0, settleT = 0;
+  int bpmHist[3] = {0}, nBpm = 0;
+  float ratioHist[5] = {0};
+  int nRatio = 0;
 
-  void reset() { *this = PulseDetector(); }
-  void clearBeat() { sX = sY = sK = sXX = sXY = sKK = sXK = sYK = 0; beatN = 0; }
+  void reset() {
+    bpm = spo2 = 0;
+    finger = contact = moving = false;
+    quality = 0;
+    head = count = sinceEstimate = 0;
+    contactT = pulseT = settleT = 0;
+    nBpm = nRatio = 0;
+    lpIr = lpRed = 0;
+  }
 
   template <class T>
   static T median(const T *v, int n) {
@@ -216,14 +220,14 @@ struct PulseDetector {
     for (int i = 0; i < n; i++) s[i] = v[i];
     for (int i = 1; i < n; i++)
       for (int j = i; j > 0 && s[j] < s[j - 1]; j--) {
-        T x = s[j];
+        T t = s[j];
         s[j] = s[j - 1];
-        s[j - 1] = x;
+        s[j - 1] = t;
       }
     return n % 2 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
   }
 
-  // One sample. Returns true when a heartbeat is accepted.
+  // One sample. Returns true when a new heart-rate estimate was made.
   bool update(uint32_t ir, uint32_t red, uint32_t t_ms) {
     if (ir < FINGER_IR || ir > SATURATED) {
       if (contact) reset();
@@ -231,123 +235,123 @@ struct PulseDetector {
     }
     if (!contact) {  // something just arrived: start the filters at its level
       contact = true;
-      contactT = t_ms;
+      contactT = settleT = t_ms;
       dcIr = baseIr = ir;
       dcRed = baseRed = red;
     }
-    // A finger is only reported while pulses are being found (allowing a few seconds to find
-    // the first). Light reflected off the room or the sensor cover has no pulse.
+    // A sudden change of level (the finger shifted or was pressed) spoils the window: start again.
+    if (fabsf(ir - dcIr) > 0.08f * dcIr) {
+      dcIr = baseIr = ir;
+      dcRed = baseRed = red;
+      lpIr = lpRed = 0;
+      head = count = sinceEstimate = 0;
+      settleT = t_ms;
+      moving = true;
+    }
     finger = t_ms - contactT < NO_PULSE_MS || (pulseT && t_ms - pulseT < NO_PULSE_MS);
     if (!finger) bpm = spo2 = 0;
-    dcIr += 0.01f * (ir - dcIr);
+
+    dcIr += 0.01f * (ir - dcIr);  // level, about 1 s
     dcRed += 0.01f * (red - dcRed);
-    baseIr += 0.04f * (ir - baseIr);
+    baseIr += 0.04f * (ir - baseIr);  // baseline, about 0.25 s: follows pressure changes
     baseRed += 0.04f * (red - baseRed);
-    // Inverted: blood arriving with each beat absorbs more light, so less comes back.
-    lpIr += 0.3f * ((baseIr - ir) - lpIr);  // and smoothed above about 5 Hz
+    lpIr += 0.3f * ((baseIr - ir) - lpIr);  // inverted (more blood = less light) and smoothed
     lpRed += 0.3f * ((baseRed - red) - lpRed);
-    if (settle < 150) {  // 1.5 s for the filters to settle after the finger arrives
-      settle++;
-      env = fabsf(lpIr);
-      return false;
-    }
 
-    // Movement: a swing far bigger than recent heartbeats. Ignore the next 0.6 s and do not
-    // count the gap as a long beat.
-    float ampMed = nAmp >= 3 ? median(amp, nAmp) : 0;
-    if (ampMed > 0 && fabsf(lpIr) > 1.5f * ampMed) {
-      quietFrom = t_ms + 600;
-      moving = true;
-      pulseT = t_ms;  // a swing this big means a finger is there, just moving
-      above = false;
-      lastPeakT = 0;
-      clearBeat();
-      return false;
-    }
-    if ((int32_t)(t_ms - quietFrom) < 0) return false;
-    if ((int32_t)(t_ms - quietFrom) > 1000) moving = false;
-
-    float k = beatN++;
-    sX += lpIr; sY += lpRed; sK += k;
-    sXX += lpIr * lpIr; sXY += lpIr * lpRed; sKK += k * k; sXK += lpIr * k; sYK += lpRed * k;
-
-    // Envelope of the pulse size, falling by half in about 1.4 s; a beat must reach 40% of it.
-    env *= 0.995f;
-    if (fabsf(lpIr) > env) env = fabsf(lpIr);
-    float th = 0.4f * env;
-
-    if (!above) {
-      if (lpIr > th && (!lastPeakT || t_ms - lastPeakT > 330)) {  // at most about 180 bpm
-        above = true;
-        peakVal = lpIr;
-        peakT = t_ms;
-      }
-      return false;
-    }
-    if (lpIr > peakVal) {
-      peakVal = lpIr;
-      peakT = t_ms;
-    }
-    if (lpIr > 0) return false;
-    above = false;  // back below the middle: the peak just passed was a beat
-    return beat();
+    if (t_ms - settleT < 1500) return false;  // let the filters settle first
+    x[head] = lpIr;
+    y[head] = lpRed;
+    tStamp[head] = t_ms;
+    head = (head + 1) % N;
+    if (count < N) count++;
+    if (++sinceEstimate < 100 || count < MIN_N) return false;
+    sinceEstimate = 0;
+    return estimate();
   }
 
-  bool beat() {
-    uint32_t prev = lastPeakT;
-    lastPeakT = peakT;
-    // Covariances over the beat with the mean and a straight-line trend removed.
-    float n = beatN, eIr = 0, eRI = 0;
-    if (n > 10) {
-      float cXX = sXX - sX * sX / n, cXY = sXY - sX * sY / n, cKK = sKK - sK * sK / n;
-      float cXK = sXK - sX * sK / n, cYK = sYK - sY * sK / n;
-      eIr = cXX - cXK * cXK / cKK;
-      eRI = cXY - cXK * cYK / cKK;
-    }
-    clearBeat();
-    if (peakVal < MIN_PULSE * dcIr) {  // far too small to be a heartbeat: sensor noise,
-      lastPeakT = prev;                // so ignore it and keep timing from the last real beat
-      return false;
-    }
-    pulseT = peakT;
-    // Remember the beat size (for movement detection) even before the rhythm is known.
-    for (int k = 4; k > 0; k--) amp[k] = amp[k - 1];
-    amp[0] = peakVal;
-    if (nAmp < 5) nAmp++;
-    if (!prev) return false;
-    uint32_t i = peakT - prev;
-    if (i < 333 || i > 1500) {  // outside 40-180 bpm: a gap or a glitch, start again
-      nIbi = 0;
-      return false;
-    }
-    if (nIbi >= 3) {
-      uint16_t med = median(ibi, nIbi);
-      if (fabsf((float)i - med) > 0.25f * med) {  // does not fit the rhythm
-        if (++rejects >= 3) nIbi = rejects = 0;   // three in a row: the rate really changed
-        return false;
-      }
-    }
-    rejects = 0;
-    for (int k = HIST - 1; k > 0; k--) ibi[k] = ibi[k - 1];
-    ibi[0] = (uint16_t)i;
-    if (nIbi < HIST) nIbi++;
-    if (nIbi >= 3) bpm = (int)(60000.0f / median(ibi, nIbi) + 0.5f);
 
-    // SpO2 from the ratio of ratios R = (red AC / red DC) / (IR AC / IR DC), with AC measured
-    // as how strongly the red pulse follows the infrared one over the whole beat: sensor
-    // noise in the weaker red signal averages out instead of inflating its size.
-    if (eIr > 0 && eRI > 0 && dcIr > 0 && dcRed > 0) {
-      float R = (eRI / eIr) * dcIr / dcRed;
-      if (R > 0.2f && R < 1.8f) {
-        for (int k = 4; k > 0; k--) ratio[k] = ratio[k - 1];
-        ratio[0] = R;
-        if (nRatio < 5) nRatio++;
-        if (nRatio >= 3) {
-          float r = median(ratio, nRatio);
-          float s = -45.060f * r * r + 30.354f * r + 94.845f;  // Maxim's calibration
-          spo2 = s > 100 ? 100 : (s < 70 ? 0 : (int)(s + 0.5f));
-        }
+  // Heart rate and SpO2 from the samples in the window.
+  bool estimate() {
+    int n = count, start = (head - n + N) % N;
+    // The real time between samples (the sensor's clock is not exactly 100 a second).
+    float period = (float)(tStamp[(head - 1 + N) % N] - tStamp[start]) / (n - 1);
+    float mx = 0, my = 0;
+    for (int i = 0; i < n; i++) {
+      cx[i] = x[(start + i) % N];
+      cy[i] = y[(start + i) % N];
+      mx += cx[i];
+      my += cy[i];
+    }
+    mx /= n;
+    my /= n;
+    // Typical pulse size: the median of the size in each second of the window. A short jolt
+    // only spoils one or two seconds, so it barely moves the median.
+    float blk[8];
+    int nb = 0;
+    for (int b0 = 0; b0 + 100 <= n && nb < 8; b0 += 100, nb++) {
+      float s = 0;
+      for (int i = b0; i < b0 + 100; i++) s += (cx[i] - mx) * (cx[i] - mx);
+      blk[nb] = sqrtf(s / 100);
+    }
+    float typical = median(blk, nb);
+    if (period <= 0 || typical < MIN_PULSE * dcIr) {  // flat: nothing pulsing (or not skin)
+      quality = 0;
+      moving = false;
+      return false;
+    }
+    // Samples far bigger than that are movement: leave them out (as zero) of both channels.
+    float sxx = 0, sxy = 0;
+    for (int i = 0; i < n; i++) {
+      float a = cx[i] - mx, b = cy[i] - my;
+      if (fabsf(a) > 3 * typical) a = b = 0;
+      cx[i] = a;
+      cy[i] = b;
+      sxx += a * a;
+      sxy += a * b;
+    }
+    float sd = sqrtf(sxx / n);
+
+    // Autocorrelation for delays between 40 and 180 beats a minute; the strongest repeat wins.
+    int lagMin = (int)(60000.0f / 180 / period), lagMax = (int)(60000.0f / 40 / period) + 1;
+    if (lagMax > n / 2) lagMax = n / 2;
+    float r[260];
+    if (lagMax + 1 >= 260) lagMax = 258;
+    for (int lag = lagMin - 1; lag <= lagMax + 1; lag++) {
+      float s = 0;
+      for (int i = 0; i + lag < n; i++) s += cx[i] * cx[i + lag];
+      r[lag] = s / ((n - lag) * sd * sd);
+    }
+    float best = -1;
+    int bestLag = 0;
+    for (int lag = lagMin; lag <= lagMax; lag++)
+      if (r[lag] > r[lag - 1] && r[lag] >= r[lag + 1] && r[lag] > best) {
+        best = r[lag];
+        bestLag = lag;
       }
+    quality = best > 0 ? best : 0;
+    moving = quality < 0.25f;
+    if (quality < MIN_QUALITY || !bestLag) return false;
+    pulseT = tStamp[(head - 1 + N) % N];
+
+    // Refine the beat length between samples with a parabola through the peak.
+    float a = r[bestLag - 1], b = r[bestLag], c = r[bestLag + 1], den = a - 2 * b + c;
+    float shift = den < 0 ? 0.5f * (a - c) / den : 0;
+    int est = (int)(60000.0f / ((bestLag + shift) * period) + 0.5f);
+    for (int k = 2; k > 0; k--) bpmHist[k] = bpmHist[k - 1];
+    bpmHist[0] = est;
+    if (nBpm < 3) nBpm++;
+    bpm = median(bpmHist, nBpm);
+
+    // SpO2: R = (red pulse / red level) / (infrared pulse / infrared level), with the red pulse
+    // measured as how strongly it follows the infrared one (sensor noise averages out).
+    float R = (sxy / sxx) * dcIr / dcRed;
+    if (R > 0.2f && R < 1.8f) {
+      for (int k = 4; k > 0; k--) ratioHist[k] = ratioHist[k - 1];
+      ratioHist[0] = R;
+      if (nRatio < 5) nRatio++;
+      float rr = median(ratioHist, nRatio);
+      float s = -45.060f * rr * rr + 30.354f * rr + 94.845f;  // Maxim's calibration
+      spo2 = s > 100 ? 100 : (s < 70 ? 0 : (int)(s + 0.5f));
     }
     return true;
   }
@@ -380,8 +384,9 @@ void send(const char *line) {
   Serial.print('\n');
 }
 
-void beep(uint32_t ms) {
-  digitalWrite(PIN_BUZZER, HIGH);
+// Flash the onboard RGB LED (this board has no buzzer). Off again after ms.
+void flash(uint8_t r, uint8_t g, uint8_t b, uint32_t ms) {
+  rgbLedWrite(PIN_RGB, r, g, b);
   buzzUntil = millis() + ms;
 }
 
@@ -519,7 +524,7 @@ void setStart() {
   lastQuality = 0;
   lastTempo = lastRom = 0;
   send("SET,START");
-  beep(80);
+  flash(0, 0, 60, 120);  // blue: set started
 }
 
 void setStop() {
@@ -550,7 +555,9 @@ void handleLine(const char *line) {
   }
 }
 
-// ---------- screen ----------
+// ---------- screen (172 x 320, portrait) ----------
+const int SW = 172, SH = 320;
+char deviceId[24] = "";
 const uint16_t BG = 0x0A06, INK = 0xFFFF, MUTED = 0xB5D6, ACCENT = 0xFD8F, GOOD = 0x5EB5, ALERT = 0xF9C7, TRACK = 0x2A49;
 
 void centered(const char *s, int y, int size, uint16_t color) {
@@ -559,121 +566,173 @@ void centered(const char *s, int y, int size, uint16_t color) {
   gfx->setTextSize(size);
   gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
   gfx->setTextColor(color);
-  gfx->setCursor((240 - w) / 2, y);
+  gfx->setCursor(w < SW ? (SW - w) / 2 : 0, y);
   gfx->print(s);
 }
 
-// One accelerometer axis: small label, value in g, and a bar from the centre (-1 g .. +1 g).
-void axis(const char *label, float v, int x) {
+// Large text if it fits across the screen, otherwise small.
+void centeredFit(const char *s, int y, uint16_t color) {
+  centered(s, y, strlen(s) * 12 <= SW - 8 ? 2 : 1, color);
+}
+
+// One accelerometer axis as a row: label, value in g, and a bar from the centre (-1..+1 g).
+void axisRow(const char *label, float v, int y) {
   char buf[12];
   gfx->setTextSize(1);
   gfx->setTextColor(MUTED);
-  gfx->setCursor(x, 194);
+  gfx->setCursor(10, y);
   gfx->print(label);
   snprintf(buf, sizeof(buf), "%+.2f", v);
-  gfx->setTextSize(2);
   gfx->setTextColor(INK);
-  gfx->setCursor(x, 204);
+  gfx->setCursor(22, y);
   gfx->print(buf);
-  int len = (int)(constrain(v, -1.0f, 1.0f) * 30);
-  gfx->fillRect(x, 223, 60, 4, TRACK);
-  if (len > 0) gfx->fillRect(x + 30, 223, len, 4, ACCENT);
-  else if (len < 0) gfx->fillRect(x + 30 + len, 223, -len, 4, ACCENT);
+  int len = (int)(constrain(v, -1.0f, 1.0f) * 50);
+  gfx->fillRect(60, y + 2, 102, 4, TRACK);
+  if (len > 0) gfx->fillRect(111, y + 2, len, 4, ACCENT);
+  else if (len < 0) gfx->fillRect(111 + len, y + 2, -len, 4, ACCENT);
 }
 
-void drawScreen() {
+// Wi-Fi state in words at the very top of both screens.
+void wifiLine() {
+  char w[32];
+  uint16_t c;
+  if (!strlen(WIFI_SSID)) {
+    snprintf(w, sizeof(w), "Wi-Fi off");
+    c = MUTED;
+  } else if (WiFi.status() != WL_CONNECTED) {
+    snprintf(w, sizeof(w), "Wi-Fi: connecting...");
+    c = ACCENT;
+  } else if (wifiLastCode == 200) {
+    snprintf(w, sizeof(w), "Wi-Fi: online");
+    c = GOOD;
+  } else if (wifiLastCode == 0) {
+    snprintf(w, sizeof(w), "Wi-Fi: sending...");
+    c = ACCENT;
+  } else {
+    snprintf(w, sizeof(w), "Wi-Fi: website error %d", wifiLastCode);
+    c = ALERT;
+  }
+  centered(w, 6, 1, c);
+}
+
+// A heart shape centred on (cx, cy), about 2*s wide.
+void drawHeart(int cx, int cy, int s, uint16_t c) {
+  gfx->fillCircle(cx - s / 2, cy - s / 4, s / 2 + 1, c);
+  gfx->fillCircle(cx + s / 2, cy - s / 4, s / 2 + 1, c);
+  gfx->fillTriangle(cx - s - 1, cy - s / 8, cx + s + 1, cy - s / 8, cx, cy + s, c);
+}
+
+// Watch face, shown whenever no set is running: the time, a heart that beats at the
+// measured rate, the heart rate large, and blood oxygen.
+void drawWatch() {
+  char buf[40];
+  bool hrHigh = hrMax && hr > hrMax;
+  gfx->fillScreen(BG);
+  wifiLine();
+
+  struct tm now;
+  if (strlen(WIFI_SSID) && getLocalTime(&now, 0)) {  // time from the internet, once on Wi-Fi
+    strftime(buf, sizeof(buf), "%H:%M", &now);
+    centered(buf, 26, 4, INK);
+    strftime(buf, sizeof(buf), "%a %d %b", &now);
+    centered(buf, 64, 2, MUTED);
+  } else {
+    centered("DoseLoop", 30, 2, INK);
+    centered(strlen(WIFI_SSID) ? "getting the time..." : "wearable", 54, 1, MUTED);
+  }
+
+  // Heart: grows briefly at each beat, at the measured rate.
+  bool big = hr && (millis() % (60000UL / hr)) < 180;
+  drawHeart(SW / 2, 112, big ? 20 : 16, hr ? ALERT : TRACK);
+
+  snprintf(buf, sizeof(buf), hr ? "%d" : "--", hr);
+  centered(buf, 146, 7, hrHigh ? ALERT : INK);
+  centered("BPM", 202, 2, hrHigh ? ALERT : MUTED);
+
+  snprintf(buf, sizeof(buf), spo2 ? "O2 %d%%" : "O2 --", spo2);
+  centered(buf, 232, 3, spo2 && spo2 < 90 ? ALERT : INK);
+
+  const char *hint = !oxOk ? "Pulse sensor not found"
+                   : hrHigh ? "Heart rate high: rest"
+                   : !finger ? "Rest a finger on the sensor"
+                   : !hr && pulse.moving ? "Hold your finger still"
+                   : !hr ? "Reading your pulse..."
+                   : "BOOT: start exercise";
+  centered(hint, 276, 1, hrHigh || !oxOk ? ALERT : !hr ? ACCENT : MUTED);
+  centered(deviceId, 300, 1, TRACK);
+  if (useCanvas) canvas->flush();
+}
+
+// Exercise screen, during a set.
+void drawWorkout() {
   char buf[40];
   bool reached = targetReps && rd.count >= targetReps;
+  bool hrHigh = hrMax && hr > hrMax;
   gfx->fillScreen(BG);
-  // Wi-Fi state in words at the very top: is the website getting the readings?
-  {
-    char w[48];
-    uint16_t c;
-    if (!strlen(WIFI_SSID)) {
-      snprintf(w, sizeof(w), "Wi-Fi off (USB only)");
-      c = MUTED;
-    } else if (WiFi.status() != WL_CONNECTED) {
-      snprintf(w, sizeof(w), "Wi-Fi: connecting to %.20s...", WIFI_SSID);
-      c = ACCENT;
-    } else if (wifiLastCode == 200) {
-      snprintf(w, sizeof(w), "Wi-Fi: connected, website OK");
-      c = GOOD;
-    } else if (wifiLastCode == 0) {
-      snprintf(w, sizeof(w), "Wi-Fi: connected, sending...");
-      c = ACCENT;
-    } else {
-      snprintf(w, sizeof(w), "Wi-Fi: connected, website error %d", wifiLastCode);
-      c = ALERT;
-    }
-    centered(w, 4, 1, c);
-  }
-  centered(exercise, 18, 2, INK);
+  wifiLine();
+  centeredFit(exercise, 22, INK);
 
   // Reps: the count, the dose and a progress bar.
   snprintf(buf, sizeof(buf), "%u", rd.count);
-  centered(buf, 38, 7, reached ? GOOD : INK);
+  centered(buf, 42, 8, reached ? GOOD : INK);
   snprintf(buf, sizeof(buf), "of %d reps", targetReps);
-  centered(buf, 92, 2, MUTED);
-  int fill = targetReps ? min(200, (int)(200L * rd.count / targetReps)) : 0;
-  gfx->fillRoundRect(20, 114, 200, 8, 4, TRACK);
-  if (fill) gfx->fillRoundRect(20, 114, fill, 8, 4, reached ? GOOD : ACCENT);
+  centered(buf, 104, 2, MUTED);
+  int fill = targetReps ? min(152, (int)(152L * rd.count / targetReps)) : 0;
+  gfx->fillRoundRect(10, 126, 152, 8, 4, TRACK);
+  if (fill) gfx->fillRoundRect(10, 126, fill, 8, 4, reached ? GOOD : ACCENT);
 
   // Heart rate and oxygen.
-  bool hrHigh = hrMax && hr > hrMax;
   if (!oxOk) {
-    centered("Pulse sensor not found", 136, 1, ALERT);
+    centered("Pulse sensor not found", 152, 1, ALERT);
   } else if (!finger) {
-    centered("Put a finger on the pulse sensor", 136, 1, MUTED);
+    centered("Rest a finger on the sensor", 152, 1, MUTED);
   } else if (!hr && pulse.moving) {
-    centered("Hold your finger still", 136, 1, ACCENT);
+    centered("Hold your finger still", 152, 1, ACCENT);
   } else if (!hr) {
-    centered("Reading pulse...", 136, 1, MUTED);
+    centered("Reading pulse...", 152, 1, MUTED);
   } else {
-    gfx->fillCircle(28, 139, 6, ALERT);
-    snprintf(buf, sizeof(buf), hr ? "%d bpm" : "-- bpm", hr);
-    gfx->setTextSize(2);
-    gfx->setTextColor(hrHigh ? ALERT : INK);
-    gfx->setCursor(40, 132);
-    gfx->print(buf);
+    snprintf(buf, sizeof(buf), "%d bpm", hr);
+    drawHeart(22, 152, 8, ALERT);
+    centered(buf, 146, 2, hrHigh ? ALERT : INK);
     snprintf(buf, sizeof(buf), spo2 ? "O2 %d%%" : "O2 --", spo2);
-    gfx->setTextColor(spo2 && spo2 < 90 ? ALERT : INK);
-    gfx->setCursor(144, 132);
-    gfx->print(buf);
+    centered(buf, 166, 2, spo2 && spo2 < 90 ? ALERT : INK);
   }
 
   if (!mpuOk || !liveFresh) {
-    centered("No motion data", 172, 2, ALERT);
-    centered("SDA GPIO11  SCL GPIO10", 198, 1, MUTED);
+    centered("No motion data", 196, 2, ALERT);
+    centered("SDA GPIO11  SCL GPIO10", 218, 1, MUTED);
   } else {
-    // Movement: during a set, how far the arm is from its resting position compared with
-    // the prescribed range (the green tick is half the range: a full rep must pass it).
-    // Outside a set, the plain tilt angle.
-    float move = setActive && rd.cal_n >= CAL_SAMPLES ? fabsf(rd.angle_f - rd.rest_deg) : liveTilt;
-    snprintf(buf, sizeof(buf), setActive ? "Moved %d deg" : "Tilt %d deg", (int)(move + 0.5f));
-    gfx->setTextSize(2);
-    gfx->setTextColor(INK);
-    gfx->setCursor(20, 156);
-    gfx->print(buf);
-    float full = setActive ? cfg.target_rom_deg : 180.0f;
-    int w = (int)(200 * constrain(move / full, 0.0f, 1.0f));
-    gfx->fillRoundRect(20, 176, 200, 10, 5, TRACK);
-    if (w) gfx->fillRoundRect(20, 176, max(w, 10), 10, 5, setActive && move >= VALID_FRAC * full ? GOOD : ACCENT);
-    if (setActive) gfx->fillRect(20 + (int)(200 * VALID_FRAC), 173, 2, 16, GOOD);
+    // How far the arm is from where it started, against the prescribed range (the green
+    // tick is half the range: a full rep must pass it).
+    float move = rd.cal_n >= CAL_SAMPLES ? fabsf(rd.angle_f - rd.rest_deg) : 0;
+    snprintf(buf, sizeof(buf), "Moved %d deg", (int)(move + 0.5f));
+    centered(buf, 194, 2, INK);
+    float full = cfg.target_rom_deg;
+    int w = (int)(152 * constrain(move / full, 0.0f, 1.0f));
+    gfx->fillRoundRect(10, 214, 152, 10, 5, TRACK);
+    if (w) gfx->fillRoundRect(10, 214, max(w, 10), 10, 5, move >= VALID_FRAC * full ? GOOD : ACCENT);
+    gfx->fillRect(10 + (int)(152 * VALID_FRAC), 211, 2, 16, GOOD);
 
     // Raw accelerometer, in g.
-    axis("X", liveAx, 20);
-    axis("Y", liveAy, 90);
-    axis("Z", liveAz, 160);
+    axisRow("X", liveAx, 236);
+    axisRow("Y", liveAy, 248);
+    axisRow("Z", liveAz, 260);
   }
 
   // Last rep: range, time and form score.
   if (lastQuality) {
-    snprintf(buf, sizeof(buf), "%u deg  %.1fs  Form %u%%", lastRom, lastTempo / 1000.0f, lastQuality);
-    centered(buf, 238, 1, lastQuality >= 70 ? GOOD : ACCENT);
+    snprintf(buf, sizeof(buf), "%udeg %.1fs Form %u%%", lastRom, lastTempo / 1000.0f, lastQuality);
+    centered(buf, 278, 1, lastQuality >= 70 ? GOOD : ACCENT);
   }
-  const char *hint = hrHigh ? "Heart rate high: rest" : !mpuOk ? "Sensor not found" : setActive ? (reached ? "Dose reached: stop" : "Set in progress") : "Press BOOT to start";
-  centered(hint, 256, 2, hrHigh || !mpuOk ? ALERT : setActive ? ACCENT : MUTED);
+  const char *hint = hrHigh ? "Heart rate high: rest" : !mpuOk ? "Sensor not found" : reached ? "Dose reached" : "BOOT: stop the set";
+  centeredFit(hint, 296, hrHigh || !mpuOk ? ALERT : reached ? GOOD : ACCENT);
   if (useCanvas) canvas->flush();
+}
+
+// The screen: the watch face between sets, the exercise screen during a set.
+void drawScreen() {
+  if (setActive) drawWorkout();
+  else drawWatch();
 }
 
 // ---------------- Wi-Fi ----------------
@@ -683,7 +742,6 @@ void drawScreen() {
 portMUX_TYPE wifiMux = portMUX_INITIALIZER_UNLOCKED;
 char wifiBody[512];
 volatile bool wifiFresh = false;
-char deviceId[24];
 
 void wifiTask(void *) {
   WiFi.mode(WIFI_STA);
@@ -704,6 +762,11 @@ void wifiTask(void *) {
       }
       vTaskDelay(pdMS_TO_TICKS(250));
       continue;
+    }
+    static bool timeSet = false;
+    if (!timeSet) {
+      configTzTime("EST5EDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
+      timeSet = true;
     }
     bool go = false;
     portENTER_CRITICAL(&wifiMux);
@@ -745,10 +808,7 @@ void queueReading(uint32_t now) {
 }
 
 void setup() {
-  pinMode(PIN_SYS_EN, OUTPUT);
-  digitalWrite(PIN_SYS_EN, HIGH);
-  pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
+  rgbLedWrite(PIN_RGB, 0, 0, 0);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(LCD_BL, OUTPUT);
   analogWrite(LCD_BL, 140);  // backlight about 55%: less heat
@@ -819,7 +879,7 @@ void loop() {
   }
 
   if (buzzUntil && (int32_t)(now - buzzUntil) >= 0) {
-    digitalWrite(PIN_BUZZER, LOW);
+    rgbLedWrite(PIN_RGB, 0, 0, 0);
     buzzUntil = 0;
   }
 
@@ -851,7 +911,7 @@ void loop() {
     if (hrMax && hr > hrMax && now - lastWarn >= 10000) {
       lastWarn = now;
       send("WARN,HR_HIGH");
-      beep(600);
+      flash(80, 0, 0, 600);  // red: heart rate over the limit
     }
   }
 
@@ -878,8 +938,9 @@ void loop() {
         lastQuality = rep.quality;
         lastTempo = rep.tempo_ms;
         lastRom = rep.rom_deg;
-        if (targetReps && rep.count == targetReps) beep(400);     // dose reached
-        else if (targetReps && rep.count > targetReps) beep(60);  // past the dose
+        if (targetReps && rep.count == targetReps) flash(0, 80, 0, 600);  // green, long: dose reached
+        else if (targetReps && rep.count > targetReps) flash(80, 40, 0, 150);  // amber: past the dose
+        else flash(0, 40, 0, 120);  // green: a rep
       } else if (ev == EV_PARTIAL) {
         snprintf(buf, sizeof(buf), "PART,%u", rep.rom_deg);
         send(buf);
@@ -903,7 +964,7 @@ void loop() {
   }
 
   if ((int32_t)(now - nextDraw) >= 0) {
-    nextDraw = now + 200;  // 5 frames a second
+    nextDraw = now + 100;  // 10 frames a second (the watch face heart beats)
     drawScreen();
   }
   delay(1);  // let the CPU idle between passes (less heat)
