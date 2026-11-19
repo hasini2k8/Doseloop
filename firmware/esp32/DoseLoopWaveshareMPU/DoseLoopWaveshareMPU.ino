@@ -736,12 +736,98 @@ void wifiLine(bool withTime) {
   int16_t x1;
   int tw = textW(w, F_SMALL, 1, &x1);
   int x = (SW - tw - 12) / 2;
+  if (strlen(WIFI_SSID)) gfx->drawRoundRect(max(1, x - 9), 2, min(SW - 2, tw + 30), 21, 10, TRACK);  // tap: Wi-Fi on/off
   gfx->fillCircle(x + 3, 12, 3, c);
   textL(w, x + 12 - x1, 17, F_SMALL, withTime ? INK : MUTED);
 }
 
 // The on-screen Wi-Fi button on the watch face (tap to go online or offline).
 const int BTN_X = 10, BTN_Y = 278, BTN_W = 152, BTN_H = 34;
+
+
+// ---------- continuous pulse screen ----------
+// Opened with the "Measure pulse" button: measures until Stop is tapped, with a live
+// waveform of the pulse signal and how strong it is, and keeps the last good reading on
+// screen (with its age) when the signal drops for a moment.
+bool pulseMode = false;
+int lastGoodHr = 0, lastGoodSpo2 = 0;
+uint32_t lastGoodMs = 0;
+
+void notePulse() {  // called every frame: remember the latest good reading
+  if (hr) {
+    lastGoodHr = hr;
+    lastGoodMs = millis();
+  }
+  if (spo2) lastGoodSpo2 = spo2;
+}
+
+void drawPulse() {
+  char buf[48];
+  bool hrHigh = hrMax && hr > hrMax;
+  gfx->fillScreen(BG);
+  wifiLine(true);
+
+  // Heart rate: live, or the last good one greyed with its age.
+  bool big = hr && (millis() % (60000UL / hr)) < 180;
+  drawHeart(SW / 2, 44, big ? 10 : 8, hr ? ALERT : TRACK);
+  uint32_t age = (millis() - lastGoodMs) / 1000;
+  if (hr) {
+    snprintf(buf, sizeof(buf), "%d", hr);
+    textC(buf, SW / 2, 124, F_BIG, 2, hrHigh ? ALERT : INK);
+    textC(hrHigh ? "bpm - rest now" : "bpm", SW / 2, 142, F_SMALL, 1, hrHigh ? ALERT : MUTED);
+  } else if (lastGoodHr && age < 120) {
+    snprintf(buf, sizeof(buf), "%d", lastGoodHr);
+    textC(buf, SW / 2, 124, F_BIG, 2, TRACK);
+    snprintf(buf, sizeof(buf), "bpm, %lus ago", (unsigned long)age);
+    textC(buf, SW / 2, 142, F_SMALL, 1, MUTED);
+  } else {
+    textC("--", SW / 2, 110, F_BIG, 1, TRACK);
+    textC("bpm", SW / 2, 142, F_SMALL, 1, MUTED);
+  }
+
+  // Live waveform: the last ~3 s of the filtered infrared signal (peaks are heartbeats).
+  card(6, 150, 160, 70);
+  int n = pulse.count < 300 ? pulse.count : 300;
+  if (pulse.contact && n > 20) {
+    float lo = 1e9f, hi = -1e9f;
+    for (int i = 0; i < n; i++) {
+      float v = pulse.x[(pulse.head - n + i + PulseDetector::N) % PulseDetector::N];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    float span = hi - lo > 1 ? hi - lo : 1;
+    int px = -1, py = 0;
+    for (int i = 0; i < n; i += 2) {
+      float v = pulse.x[(pulse.head - n + i + PulseDetector::N) % PulseDetector::N];
+      int x = 12 + (int)((long)i * 148 / n), y = 212 - (int)((v - lo) / span * 54);
+      if (px >= 0) gfx->drawLine(px, py, x, y, hr ? ACCENT : MUTED);
+      px = x;
+      py = y;
+    }
+  } else {
+    centered(!oxOk ? "Pulse sensor not found" : !pulse.contact ? "Put the sensor on your skin" : "Starting...", 180, 1, MUTED);
+  }
+
+  // Signal strength (how clearly the pulse repeats) and a hint.
+  float q = pulse.contact ? pulse.quality : 0;
+  textL("Signal", 10, 240, F_SMALL, MUTED);
+  gfx->fillRoundRect(64, 231, 98, 8, 4, TRACK);
+  if (q > 0.02f) gfx->fillRoundRect(64, 231, (int)(98 * (q > 1 ? 1 : q)), 8, 4, q >= 0.6f ? GOOD : q >= 0.45f ? ACCENT : WARN);
+  const char *hint = !pulse.contact ? "" : pulse.faint ? "Too faint: snug the strap" : pulse.moving ? "Keep still..." : q >= 0.6f ? "Strong signal" : q >= 0.45f ? "OK signal" : "Weak: hold still";
+  centered(hint, 246, 1, q >= 0.45f ? MUTED : WARN);
+
+  // Oxygen.
+  textL("Oxygen", 10, 272, F_SMALL, MUTED);
+  int o2 = spo2 ? spo2 : 0;
+  snprintf(buf, sizeof(buf), o2 ? "%d%%" : "--", o2);
+  textR(buf, 162, 274, F_MED, o2 ? (o2 < 90 ? ALERT : INK) : TRACK);
+
+  // Stop.
+  gfx->fillRoundRect(BTN_X, BTN_Y + 6, BTN_W, BTN_H - 6, (BTN_H - 6) / 2, CARD);
+  gfx->drawRoundRect(BTN_X, BTN_Y + 6, BTN_W, BTN_H - 6, (BTN_H - 6) / 2, MUTED);
+  textC("Stop measuring", SW / 2, BTN_Y + 25, F_SMALLB, 1, INK);
+  if (useCanvas) canvas->flush();
+}
 
 // Watch face, shown whenever no set is running.
 void drawWatch() {
@@ -792,17 +878,10 @@ void drawWatch() {
   snprintf(buf, sizeof(buf), spo2 ? "%d%%" : "--", spo2);
   textR(buf, 154, 258, F_MED, spo2 ? (spo2 < 90 ? ALERT : INK) : TRACK);
 
-  // Wi-Fi button (a pill).
-  if (strlen(WIFI_SSID)) {
-    bool online = wifiWanted && WiFi.status() == WL_CONNECTED;
-    uint16_t fill = !wifiWanted ? ACCENT : online ? CARD : TRACK;
-    gfx->fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, BTN_H / 2, fill);
-    if (online) gfx->drawRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, BTN_H / 2, ACCENT);
-    const char *label = !wifiWanted ? "Go online" : online ? "Online" : "Connecting...";
-    textC(label, SW / 2, BTN_Y + 22, F_SMALLB, 1, !wifiWanted ? BG : online ? ACCENT : INK);
-  } else {
-    textC("BOOT: start exercise", SW / 2, 300, F_SMALL, 1, MUTED);
-  }
+  // "Measure pulse" button (a pill). Wi-Fi is the status pill at the top.
+  gfx->fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, BTN_H / 2, ACCENT);
+  drawHeart(BTN_X + 12, BTN_Y + 17, 5, BG);
+  textC("Measure pulse", SW / 2 + 8, BTN_Y + 22, F_SMALLB, 1, BG);
   if (useCanvas) canvas->flush();
 }
 
@@ -908,17 +987,24 @@ void handleTap(int x, int y) {
   char b[48];
   snprintf(b, sizeof(b), "TOUCH,%d,%d", x, y);
   send(b);
-  if (setActive || !strlen(WIFI_SSID)) return;
-  if (y >= BTN_Y - 10 && y <= BTN_Y + BTN_H + 16) {
+  if (y < 34 && strlen(WIFI_SSID)) {  // the status pill at the top: Wi-Fi on/off
     wifiWanted = !wifiWanted;
     prefs.putBool("wifi", wifiWanted);
     send(wifiWanted ? "WIFI,ON" : "WIFI,OFF");
+    return;
+  }
+  if (setActive) return;
+  if (y >= BTN_Y - 12) {  // the big bottom button: open or close the pulse screen
+    pulseMode = !pulseMode;
+    send(pulseMode ? "PULSE,ON" : "PULSE,OFF");
   }
 }
 
 // The screen: the watch face between sets, the exercise screen during a set.
 void drawScreen() {
+  notePulse();
   if (setActive) drawWorkout();
+  else if (pulseMode) drawPulse();
   else drawWatch();
 }
 
