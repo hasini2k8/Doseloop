@@ -5,6 +5,7 @@ const path = require('node:path');
 const { open, seed, displayName } = require('./db');
 const engine = require('./engine');
 const { createAi } = require('./ai');
+const Fusion = require('../web/fusion.js');
 
 const WEB_DIR = path.join(__dirname, '..', 'web');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
@@ -36,6 +37,34 @@ function text(v, name, max, required) {
   if (required && !s) throw bad(`${name} is required`);
   if (s.length > max) throw bad(`${name} is too long (max ${max} characters)`);
   return s;
+}
+// Form faults counted by the camera during a set: {fault id: times}, stored as JSON.
+function formIssues(v) {
+  if (v == null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) throw bad('Form issues must be an object');
+  const out = {};
+  for (const [k, n] of Object.entries(v)) {
+    if (!/^[a-z-]{1,24}$/.test(k)) throw bad('Unknown form issue');
+    out[k] = int(n, 'Form issue count', 0, 500);
+  }
+  if (Object.keys(out).length > 10) throw bad('Too many form issues');
+  return JSON.stringify(out);
+}
+// Summary of a set the watch and camera counted together (RepFusion.finish()).
+function fusionSummary(v) {
+  if (v == null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) throw bad('Fusion summary must be an object');
+  const out = {
+    primary: oneOf(v.primary, 'Fusion primary', ['watch', 'camera']),
+    policy: oneOf(v.policy || 'primary', 'Fusion policy', ['primary', 'confirmed']),
+    calibrated: !!v.calibrated,
+  };
+  for (const k of ['confirmed', 'unconfirmed', 'possible', 'rejected', 'failover']) out[k] = int(v[k] ?? 0, `Fusion ${k}`, 0, 500);
+  out.agreement = optInt(v.agreement, 'Fusion agreement', 0, 100);
+  out.rom_watch = optInt(v.rom_watch, 'Fusion watch range', 0, 360);
+  out.rom_camera = optInt(v.rom_camera, 'Fusion camera range', 0, 360);
+  out.offset_ms = optInt(v.offset_ms, 'Fusion offset', -5000, 5000);
+  return JSON.stringify(out);
 }
 function oneOf(v, name, options) {
   if (!options.includes(v)) throw bad(`${name} must be one of: ${options.join(', ')}`);
@@ -84,6 +113,8 @@ function createApp(db, ai = createAi()) {
       .all(p.id);
     const bySession = new Map();
     for (const s of sets) {
+      s.form_issues = s.form_issues ? JSON.parse(s.form_issues) : null;
+      s.fusion = s.fusion ? JSON.parse(s.fusion) : null;
       if (!bySession.has(s.session_id)) bySession.set(s.session_id, []);
       bySession.get(s.session_id).push(s);
     }
@@ -143,7 +174,8 @@ function createApp(db, ai = createAi()) {
     if (e.hr_max && e.hr && e.hr > e.hr_max) f.push({ kind: 'hr', level: 'alert', text: `HR ${e.hr} over ${e.hr_max}` });
     if (e.status === 'active' && e.target && e.reps > e.target * 1.2 && e.reps - e.target >= 2) f.push({ kind: 'overdose', level: 'alert', text: 'Past prescribed dose' });
     if (e.status === 'active' && now - e.updated > 45000) f.push({ kind: 'idle', level: 'warn', text: `No movement for ${Math.round((now - e.updated) / 1000)} s` });
-    if (e.quality != null && e.quality < 60 && e.reps >= 3) f.push({ kind: 'quality', level: 'warn', text: 'Check form' });
+    if (e.status === 'active' && e.form) f.push({ kind: 'form', level: 'warn', text: e.form });
+    else if (e.quality != null && e.quality < 60 && e.reps >= 3) f.push({ kind: 'quality', level: 'warn', text: 'Check form' });
     if (e.status === 'done') f.push({ kind: 'done', level: 'good', text: 'Finished' });
     return f;
   }
@@ -274,7 +306,7 @@ function createApp(db, ai = createAi()) {
     const o = overview(p);
     return {
       ...o,
-      participant: { ...p, age: new Date().getFullYear() - p.birth_year, display_name: displayName(p.name) },
+      participant: { ...p, fusion_cfg: undefined, fusion: p.fusion_cfg ? JSON.parse(p.fusion_cfg) : null, age: new Date().getFullYear() - p.birth_year, display_name: displayName(p.name) },
       assessments: db.prepare('SELECT * FROM assessments WHERE participant_id = ? ORDER BY date').all(p.id),
       audit: db.prepare('SELECT * FROM audit WHERE participant_id = ? ORDER BY at DESC LIMIT 30').all(p.id),
     };
@@ -297,6 +329,23 @@ function createApp(db, ai = createAi()) {
   });
 
   // Prescribing always creates a new version; old versions are kept for the record.
+  // Watch + camera settings and calibration (see web/fusion.js). null clears them.
+  route('PUT', '/api/participants/(\\d+)/fusion', (m, body) => {
+    const p = getParticipant(Number(m[1]));
+    let clean = null;
+    if (body.settings != null) {
+      try {
+        clean = Fusion.sanitize(body.settings);
+      } catch (e) {
+        throw bad(e.message);
+      }
+    }
+    db.prepare('UPDATE participants SET fusion_cfg = ? WHERE id = ?').run(clean ? JSON.stringify(clean) : null, p.id);
+    const what = body.calibrated ? `Calibrated watch + camera for ${text(body.calibrated, 'Exercise', 60)}` : clean ? 'Changed watch + camera settings' : 'Reset watch + camera settings';
+    audit(text(body.actor, 'Actor', 80) || 'Participant app', 'fusion', p.id, what);
+    return { fusion: clean };
+  });
+
   route('POST', '/api/participants/(\\d+)/dosages', (m, body) => {
     const p = getParticipant(Number(m[1]));
     const freq = int(body.frequency_per_week, 'Sessions per week', 1, 7);
@@ -369,8 +418,8 @@ function createApp(db, ai = createAi()) {
     if (!item) throw bad('Exercise is not part of the prescribed dose');
     const setNo = int(body.set_no, 'Set number', 1, 10);
     const r = db
-      .prepare('INSERT INTO session_sets (session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(s.id, item.exercise_id, setNo, item.target, int(body.done, 'Amount done', 0, 500), optInt(body.partials, 'Partial reps', 0, 500) || 0, optInt(body.tempo_ms, 'Tempo', 0, 20000), optInt(body.rom_deg, 'Range', 0, 180), optInt(body.quality, 'Quality', 0, 100), optInt(body.hr_avg, 'Average HR', 30, 230), optInt(body.hr_peak, 'Peak HR', 30, 230), oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual']));
+      .prepare('INSERT INTO session_sets (session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source, form_issues, fusion, spo2_min) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(s.id, item.exercise_id, setNo, item.target, int(body.done, 'Amount done', 0, 500), optInt(body.partials, 'Partial reps', 0, 500) || 0, optInt(body.tempo_ms, 'Tempo', 0, 20000), optInt(body.rom_deg, 'Range', 0, 180), optInt(body.quality, 'Quality', 0, 100), optInt(body.hr_avg, 'Average HR', 30, 230), optInt(body.hr_peak, 'Peak HR', 30, 230), oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual', 'fused']), formIssues(body.form_issues), fusionSummary(body.fusion), optInt(body.spo2_min, 'Lowest SpO2', 50, 100));
     return { id: Number(r.lastInsertRowid) };
   });
 
@@ -531,7 +580,8 @@ function createApp(db, ai = createAi()) {
       hr: optInt(body.hr, 'HR', 30, 230),
       hr_max: p.hr_max,
       status: oneOf(body.status || 'active', 'Status', ['active', 'resting', 'done']),
-      source: oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual']),
+      source: oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual', 'fused']),
+      form: text(body.form, 'Form', 120) || null,
       updated: Date.now(),
     });
     broadcast();
@@ -617,11 +667,11 @@ function createApp(db, ai = createAi()) {
     const p = getParticipant(pid);
     const o = overview(p);
     const q = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'session_rpe', 'session_pain', 'session_completion_pct'].join(',')];
+    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'form_issues', 'session_rpe', 'session_pain', 'session_completion_pct', 'counted_by', 'reps_confirmed', 'reps_unconfirmed', 'reps_possible', 'sensor_agreement_pct', 'spo2_min'].join(',')];
     const version = new Map(o.dosages.map((d) => [d.id, d.version]));
     for (const s of [...o.sessions].reverse()) {
       for (const t of s.sets) {
-        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, s.rpe, s.pain, Math.round(s.metrics.completion * 100)].map(q).join(','));
+        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, t.form_issues ? Object.entries(t.form_issues).map(([k, n]) => `${k} x${n}`).join('; ') : '', s.rpe, s.pain, Math.round(s.metrics.completion * 100), t.fusion ? t.fusion.primary : '', t.fusion ? t.fusion.confirmed : '', t.fusion ? t.fusion.unconfirmed : '', t.fusion ? t.fusion.possible : '', t.fusion ? t.fusion.agreement : '', t.spo2_min].map(q).join(','));
       }
     }
     return { name: p.name, body: lines.join('\r\n') + '\r\n' };

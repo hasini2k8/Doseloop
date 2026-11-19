@@ -264,3 +264,114 @@ test('wearable endpoint rejects bad device names and unknown devices', async () 
   assert.equal((await api('POST', '/api/device', { device: '!!!' })).status, 400);
   assert.equal((await api('GET', '/api/device/nobody')).status, 404);
 });
+
+test('form faults from the camera are saved per set, flagged and exported', async () => {
+  const created = await api('POST', '/api/participants', { name: 'Form Check', birth_year: 1950, program: 'general', mode: 'home', status: 'waitlist', referral_source: 'Self' });
+  const id = created.body.id;
+  await api('POST', `/api/participants/${id}/dosages`, { frequency_per_week: 3, target_rpe: 4, actor: 'T. Tester', items: [{ exercise_id: 1, sets: 2, target: 8 }] });
+  const s = (await api('POST', '/api/sessions', { participant_id: id })).body;
+  assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 1, done: 8, form_issues: { 'knees-in': 'x' } })).status, 400);
+  assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 1, done: 8, form_issues: ['knees-in'] })).status, 400);
+  await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 1, done: 8, source: 'camera', form_issues: { 'knees-in': 2, lean: 1 } });
+  await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 2, done: 8, source: 'device', form_issues: {} });
+  await api('POST', `/api/sessions/${s.id}/finish`, { rpe: 3, pain: 0 });
+
+  const detail = (await api('GET', `/api/participants/${id}`)).body;
+  const sets = detail.sessions[0].sets;
+  assert.deepEqual(sets.map((t) => t.form_issues), [{ 'knees-in': 2, lean: 1 }, {}]);
+  assert.ok(detail.flags.some((f) => f.kind === 'form' && /3 times/.test(f.text)));
+
+  const csv = await (await fetch(`${base}/api/participants/${id}/export.csv`)).text();
+  assert.match(csv, /knees-in x2; lean x1/);
+});
+
+test('live board shows the form fault the camera sees right now', async () => {
+  const p = await byName('Ruth');
+  await api('POST', '/api/live', { participant_id: p.id, exercise: 'Bicep curl', set: 1, sets: 2, reps: 3, target: 10, quality: 40, source: 'camera', form: 'Keep your elbow at your side' });
+  let e = (await api('GET', '/api/live')).body.board.find((x) => x.participant_id === p.id);
+  assert.deepEqual(e.flags.map((f) => [f.kind, f.text]), [['form', 'Keep your elbow at your side']]);
+  await api('POST', '/api/live', { participant_id: p.id, exercise: 'Bicep curl', set: 1, sets: 2, reps: 4, target: 10, quality: 90, source: 'camera' });
+  e = (await api('GET', '/api/live')).body.board.find((x) => x.participant_id === p.id);
+  assert.equal(e.flags.length, 0);
+});
+
+test('an older database gains the form_issues column and keeps its sets', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const path = require('node:path');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doseloop-'));
+  const file = path.join(dir, 'old.db');
+  const raw = new DatabaseSync(file);
+  raw.exec("CREATE TABLE session_sets (id INTEGER PRIMARY KEY, session_id INTEGER, exercise_id INTEGER, set_no INTEGER, target INTEGER, done INTEGER, partials INTEGER, tempo_ms INTEGER, rom_deg INTEGER, quality INTEGER, hr_avg INTEGER, hr_peak INTEGER, source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('device','sim','camera','manual')))");
+  raw.exec("INSERT INTO session_sets VALUES (1, 1, 1, 1, 10, 10, 0, 2000, 70, 80, 100, 110, 'device')");
+  raw.close();
+  const db = open(file);
+  const cols = db.prepare('PRAGMA table_info(session_sets)').all().map((c) => c.name);
+  assert.ok(cols.includes('form_issues'));
+  assert.equal(db.prepare('SELECT done FROM session_sets WHERE id = 1').get().done, 10);
+  db.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------- watch + camera fusion ----------
+
+test('watch + camera settings are validated, saved per participant and audited', async () => {
+  const p = await byName('Ruth');
+  const url = `/api/participants/${p.id}/fusion`;
+  assert.equal((await api('PUT', url, { settings: { spo2Stop: 93, spo2Caution: 91 } })).status, 400);
+  assert.equal((await api('PUT', url, { settings: { exercises: { 'Bicep curl': { primary: 'elbow' } } } })).status, 400);
+  const settings = { policy: 'confirmed', spo2Caution: 93, rateLimited: true, exercises: { 'Bicep curl': { primary: 'watch', offsetMs: 320, windowMs: 520, romScale: 0.85, reps: 6, calibratedAt: '2026-11-19T10:00:00.000Z' } } };
+  const r = await api('PUT', url, { settings, calibrated: 'Bicep curl' });
+  assert.equal(r.status, 200);
+  const got = (await api('GET', `/api/participants/${p.id}`)).body;
+  assert.deepEqual(got.participant.fusion, settings);
+  assert.equal(got.participant.fusion_cfg, undefined);
+  assert.ok(got.audit.some((a) => a.action === 'fusion' && /Calibrated watch \+ camera for Bicep curl/.test(a.detail)));
+  await api('PUT', url, { settings: null });
+  assert.equal((await api('GET', `/api/participants/${p.id}`)).body.participant.fusion, null);
+});
+
+test('a set counted by watch + camera keeps its fusion summary, SpO2 and flags disagreement', async () => {
+  const created = await api('POST', '/api/participants', { name: 'Fusion Check', birth_year: 1949, program: 'general', mode: 'home', status: 'waitlist', referral_source: 'Self' });
+  const id = created.body.id;
+  await api('POST', `/api/participants/${id}/dosages`, { frequency_per_week: 3, target_rpe: 4, actor: 'T. Tester', items: [{ exercise_id: 3, sets: 1, target: 10 }] });
+  const s = (await api('POST', '/api/sessions', { participant_id: id })).body;
+  assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 3, set_no: 1, done: 8, source: 'fused', fusion: { primary: 'nose' } })).status, 400);
+  const fusion = { primary: 'watch', policy: 'primary', calibrated: true, confirmed: 3, unconfirmed: 5, possible: 1, rejected: 0, failover: 0, agreement: 33, rom_watch: 104, rom_camera: 88, offset_ms: 310 };
+  assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 3, set_no: 1, done: 8, source: 'fused', fusion, spo2_min: 89, hr_avg: 100, hr_peak: 110 })).status, 200);
+  await api('POST', `/api/sessions/${s.id}/finish`, { rpe: 4, pain: 0 });
+  const detail = (await api('GET', `/api/participants/${id}`)).body;
+  const set = detail.sessions[0].sets[0];
+  assert.equal(set.source, 'fused');
+  assert.deepEqual(set.fusion, fusion);
+  assert.equal(set.spo2_min, 89);
+  assert.ok(detail.flags.some((f) => f.kind === 'sensors' && /disagreed on 6 of 9 reps/.test(f.text)));
+  assert.ok(detail.flags.some((f) => f.kind === 'spo2' && /89%/.test(f.text)));
+  const csv = await (await fetch(`${base}/api/participants/${id}/export.csv`)).text();
+  const rows = csv.split(/\r?\n/);
+  assert.match(rows[0], /counted_by,reps_confirmed,reps_unconfirmed,reps_possible,sensor_agreement_pct,spo2_min$/);
+  assert.match(rows[1], /,watch,3,5,1,33,89$/);
+});
+
+test('a database from before fusion keeps its sets and accepts fused ones', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const path = require('node:path');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doseloop-'));
+  const file = path.join(dir, 'old.db');
+  const raw = new DatabaseSync(file);
+  raw.exec("CREATE TABLE participants (id INTEGER PRIMARY KEY, name TEXT NOT NULL, birth_year INTEGER, program TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', mode TEXT NOT NULL DEFAULT 'clinic', conditions TEXT NOT NULL DEFAULT '', goals TEXT NOT NULL DEFAULT '', referral_source TEXT NOT NULL DEFAULT '', hr_max INTEGER, share_feed INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)");
+  raw.exec("CREATE TABLE session_sets (id INTEGER PRIMARY KEY, session_id INTEGER, exercise_id INTEGER, set_no INTEGER, target INTEGER, done INTEGER, partials INTEGER, tempo_ms INTEGER, rom_deg INTEGER, quality INTEGER, hr_avg INTEGER, hr_peak INTEGER, source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('device','sim','camera','manual')), form_issues TEXT)");
+  raw.exec(`INSERT INTO session_sets VALUES (1, 1, 1, 1, 10, 10, 0, 2000, 70, 80, 100, 110, 'camera', '{"lean":1}')`);
+  raw.close();
+  const db = open(file);
+  const cols = db.prepare('PRAGMA table_info(session_sets)').all().map((c) => c.name);
+  assert.ok(cols.includes('fusion') && cols.includes('spo2_min'));
+  assert.ok(db.prepare('PRAGMA table_info(participants)').all().some((c) => c.name === 'fusion_cfg'));
+  assert.equal(db.prepare('SELECT form_issues FROM session_sets WHERE id = 1').get().form_issues, '{"lean":1}');
+  assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'session_sets'").get().sql, /'fused'/);
+  db.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

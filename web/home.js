@@ -42,6 +42,7 @@
           while ((nl = buf.indexOf('\n')) >= 0) {
             const line = buf.slice(0, nl).trim();
             buf = buf.slice(nl + 1);
+            this.lastLineAt = performance.now(); // the watch sends a DATA line every second
             if (line) this.onLine(line);
           }
         }
@@ -54,51 +55,55 @@
       this.kind = 'sim';
     }
 
-    // The camera speaks the same line protocol as the wearable: pose landmarks become joint
-    // angles, a rep counter turns those into REP/PART lines, and every ~0.4 s a CAM line
-    // reports what the classifier sees: CAM,<visible>,<full body>,<active>,<confidence %>,<label>.
-    async useCamera(box, onStatus) {
+    // Counting with the camera. The session's form camera is always running; in this mode its
+    // frames are fed in here (cameraFrame) and a rep counter turns the joint angles into the
+    // same REP/PART lines the wearable sends.
+    useCamera() {
       this.kind = 'camera';
       this.counter = null;
-      let lastCam = 0;
-      const cam = await DL.camera.start({
-        video: box.querySelector('video'),
-        overlay: box.querySelector('canvas'),
-        onStatus,
-        onFrame: (f) => {
-          if (this.counter && f.fullBody && f.angles) {
-            const ev = this.counter.update(f.angles, f.t);
-            if (ev && ev.type === 'rep') this.onLine(`REP,${ev.count},${ev.tempo},${ev.rom},${ev.quality}`);
-            else if (ev) this.onLine(`PART,${ev.rom}`);
-          }
-          if (f.t - lastCam > 400) {
-            lastCam = f.t;
-            const p = f.pred;
-            this.onLine(`CAM,${f.visible ? 1 : 0},${f.fullBody ? 1 : 0},${p ? (p.active ? 1 : 0) : ''},${p ? Math.round(p.prob * 100) : ''},${p ? p.label : ''}`);
-          }
-        },
-      });
-      if (this.kind !== 'camera') cam.stop(); // closed while the camera was starting
-      else this.cam = cam;
-      box.classList.toggle('rear', !cam.mirrored);
+    }
+
+    // Watch + camera together: the watch over USB as above, and the camera's rep counter
+    // alongside it. The camera's lines are prefixed "CAM," so the session can tell them apart;
+    // the session's fusion decides what counts.
+    async useFused() {
+      await this.connectSerial();
+      this.fused = true;
+      this.counter = null;
+      this.lastLineAt = performance.now();
+    }
+
+    cameraFrame(f) {
+      if ((this.kind !== 'camera' && !this.fused) || !this.counter || !f.fullBody || !f.angles) return;
+      const ev = this.counter.update(f.angles, f.t);
+      const pre = this.fused ? 'CAM,' : '';
+      if (ev && ev.type === 'rep') this.onLine(`${pre}REP,${ev.count},${ev.tempo ?? ''},${ev.rom},${ev.quality}`); // empty tempo: not known for this rep
+      else if (ev) this.onLine(`${pre}PART,${ev.rom}`);
+    }
+
+    // The camera's side of EX / START / STOP. On its own it reports the set starting and
+    // stopping; alongside the watch, the watch does that.
+    camCommand(line) {
+      const f = line.split(',');
+      if (f[0] === 'EX') this.exercise = line.slice(3);
+      else if (f[0] === 'START') {
+        this.counter = DLMotion.SIGNALS[this.exercise] ? new DLMotion.RepCounter(this.exercise) : null;
+        if (!this.fused) this.onLine('SET,START');
+      } else if (f[0] === 'STOP' && this.counter) {
+        const c = this.counter;
+        this.counter = null;
+        if (!this.fused) this.onLine(`SET,STOP,${c.count},${c.partials}`);
+      }
     }
 
     send(line) {
       if (this.kind === 'device') {
         this.writer.write(new TextEncoder().encode(`${line}\n`)).catch(() => this.onLine('LOST'));
+        if (this.fused) this.camCommand(line);
       } else if (this.kind === 'sim') {
         this.simCommand(line);
       } else if (this.kind === 'camera') {
-        const f = line.split(',');
-        if (f[0] === 'EX') this.exercise = line.slice(3);
-        else if (f[0] === 'START') {
-          this.counter = DLMotion.SIGNALS[this.exercise] ? new DLMotion.RepCounter(this.exercise) : null;
-          this.onLine('SET,START');
-        } else if (f[0] === 'STOP' && this.counter) {
-          const c = this.counter;
-          this.counter = null;
-          this.onLine(`SET,STOP,${c.count},${c.partials}`);
-        }
+        this.camCommand(line);
       }
     }
 
@@ -145,11 +150,25 @@
       this.simCount = null;
     }
 
+    // Watch + camera, after the watch is unplugged: drop the USB link, keep the camera counting.
+    async dropSerial() {
+      const port = this.port;
+      this.port = null;
+      this.kind = 'camera';
+      if (!port) return;
+      try {
+        await this.reader.cancel();
+        this.writer.releaseLock();
+        await port.close();
+      } catch {
+        /* already gone */
+      }
+    }
+
     async close() {
       this.simStop();
-      if (this.cam) this.cam.stop();
-      this.cam = null;
       this.counter = null;
+      this.fused = false;
       const port = this.port;
       this.port = null;
       this.kind = null;
@@ -301,7 +320,7 @@
     for (const it of o.active.items) for (let s = 1; s <= it.sets; s++) steps.push({ ...it, set: s });
 
     let idx = 0;
-    let source = 'manual'; // 'device' | 'sim' | 'camera' | 'manual'
+    let source = 'manual'; // 'device' | 'sim' | 'camera' | 'manual'; the camera is picked on open
     let cam = null; // what the camera last reported
     let running = false;
     let cur = null; // live numbers for the set in progress
@@ -312,6 +331,17 @@
     let lastFrac = 0; // ring position last drawn, so the arc moves on from there
     let fresh = true; // first draw of the current step
     let shown = -1; // count last drawn, so the number only "pops" when it changes
+    // Watch + camera (see fusion.js): settings and calibration saved for this participant,
+    // the rep matcher for the set in progress, and heart rate / oxygen read with movement.
+    let fcfg = DLFusion.settings(p.fusion);
+    let fusion = null;
+    let fmode = 'both'; // who is counting: 'both' | 'watch' | 'camera' | 'none'
+    let camSeenAt = -Infinity; // last frame with the whole body in view
+    let calib = null; // result of the last calibration, until saved or discarded
+    const bio = new DLFusion.BioMonitor(p.fusion, p.hr_max);
+    let safety = { level: 'ok', reasons: [] };
+    let safetyTick = null;
+    let restOverride = false; // "start anyway" before heart rate has recovered
     const tracker = new Tracker((line) => !closed && onLine(line));
     // One canvas for the whole session; each redraw moves it back into its slot.
     const figCanvas = document.createElement('canvas');
@@ -344,13 +374,214 @@
     }
     const camLabel = camBox.querySelector('.cam-label');
     const camActive = () => !!(cam && cam.active && performance.now() - cam.at < 2500);
+
+    // ---------- form camera: always tracking limbs and joint angles, whatever is counting ----------
+    // It starts with the session and runs alongside the wearable, the demo sensor or counting
+    // by hand. When the camera is also chosen to count, the same frames feed the rep counter.
+    const LINES_KEY = 'doseloop.formLines';
+    let showLines = true;
+    try {
+      showLines = localStorage.getItem(LINES_KEY) !== '0';
+    } catch {
+      /* storage blocked: lines stay on */
+    }
+    // [name, left angle, right angle, left landmark, right landmark]; angles index DLMotion.frameAngles.
+    const JOINTS = [['Shoulder', 6, 7, 11, 12], ['Elbow', 4, 5, 13, 14], ['Hip', 2, 3, 23, 24], ['Knee', 0, 1, 25, 26]];
+    const formCard = document.createElement('div');
+    formCard.className = 'card form-card';
+    formCard.innerHTML = `
+      <div class="row spread form-head">
+        <div><h2 style="margin:0">${icon('camera')} Form camera</h2><p class="muted small form-status">Starting the camera…</p></div>
+        <label class="switch"><input type="checkbox" id="form-lines" ${showLines ? 'checked' : ''}><span class="track" aria-hidden="true"></span>Show limb lines</label>
+      </div>
+      <div class="form-grid">
+        <div class="form-cam-slot"></div>
+        <table class="angles" aria-label="Joint angles in degrees">
+          <thead><tr><th>Joint</th><th>Left</th><th>Right</th></tr></thead>
+          <tbody>${JOINTS.map(([n]) => `<tr><th>${n}</th><td data-a="${n}L">–</td><td data-a="${n}R">–</td></tr>`).join('')}</tbody>
+        </table>
+      </div>
+      <div class="form-alert" role="status" aria-live="polite" hidden></div>
+      <button class="ghost form-retry" hidden>${icon('camera')} Try the camera again</button>`;
+    const formStatus = formCard.querySelector('.form-status');
+    const formAlert = formCard.querySelector('.form-alert');
+    const formRetry = formCard.querySelector('.form-retry');
+    const angleCells = Object.fromEntries([...formCard.querySelectorAll('[data-a]')].map((td) => [td.dataset.a, td]));
+    const setFormStatus = (text, warn = false) => {
+      formStatus.textContent = text;
+      formStatus.classList.toggle('warn-text', warn);
+    };
+    let formCam = null; // the running camera
+    let formStarting = null; // promise while it starts
+    let formOff = false; // stopped for good (session over)
+    let lastCamMsg = 0;
+    let lastTable = 0;
+
+    function fillAngles(f) {
+      for (const [n, l, r, il, ir] of JOINTS) {
+        const val = (k, i) => (f.smooth && f.landmarks && f.landmarks[i].visibility >= 0.5 ? `${Math.round(f.smooth[k])}°` : '–');
+        angleCells[`${n}L`].textContent = val(l, il);
+        angleCells[`${n}R`].textContent = val(r, ir);
+      }
+    }
+
+    // ---------- form checks: per-exercise rules on the camera's joint angles, during a set ----------
+    let formCheck = null; // DLMotion.FormChecker for the set in progress
+    const lastSaid = {}; // cue id -> when it was last spoken
+    const formActive = () => (formCheck ? formCheck.active() : []);
+
+    // While a set runs the whole screen takes a tint: green, amber for a caution (a form cue,
+    // fatigue, oxygen a little low, a sensor that lost track), red to stop (heart rate or
+    // oxygen out of range, well past the dose).
+    function tint() {
+      const on = !!(running && cur && !closed && idx < steps.length);
+      const cls = document.documentElement.classList;
+      cls.toggle('exercising', on);
+      cls.toggle('tint-alert', on && safety.level === 'stop');
+      cls.toggle('tint-warn', on && safety.level === 'caution');
+    }
+
+    // One safety level from everything (fusion.js assess). New reasons are spoken once;
+    // form cues are spoken by checkForm with their own timing.
+    function evaluate() {
+      if (!cur || closed || idx >= steps.length) {
+        safety = { level: 'ok', reasons: [] };
+        return tint();
+      }
+      const st = steps[idx];
+      const t = performance.now();
+      const over = st.unit === 'reps' && cur.reps > st.target * 1.2 && cur.reps - st.target >= 2;
+      const next = DLFusion.assess({
+        bio: bio.reasons(t, { during: running }),
+        formFaults: formActive(),
+        fatigue: running && st.unit === 'reps' ? DLFusion.fatigue(cur.repLog, fcfg) : null,
+        overDose: over,
+        sensors: running && source === 'fused' && fmode === 'none' ? 'none' : null,
+      });
+      const before = new Set(safety.reasons.map((r) => r.code));
+      for (const r of next.reasons) if (!before.has(r.code) && !r.code.startsWith('form:') && r.code !== 'overdose') voice.say(r.text, r.level === 'stop');
+      const changed = next.level !== safety.level || next.reasons.map((r) => r.code).join() !== safety.reasons.map((r) => r.code).join();
+      safety = next;
+      cur.hrHigh = next.reasons.some((r) => r.code === 'hr');
+      tint();
+      return changed;
+    }
+
+    function showForm() {
+      evaluate();
+      const active = formActive();
+      if (formCam) formCam.setHighlight(active.flatMap((r) => r.joints));
+      const st = steps[Math.min(idx, steps.length - 1)];
+      if (!running || !st) formAlert.hidden = true;
+      else if (!(DLMotion.FORM_RULES[st.name] || []).length) {
+        formAlert.hidden = false;
+        formAlert.className = 'form-alert';
+        formAlert.textContent = 'No form checks for this exercise.';
+      } else {
+        formAlert.hidden = false;
+        const judged = formCheck && formCheck.judged > 15; // about half a second of clear view
+        formAlert.className = `form-alert ${active.length ? 'bad' : judged ? 'good' : ''}`;
+        formAlert.textContent = active.length ? active.map((r) => r.cue).join(' · ') : judged ? '✓ Form looks good' : 'Checking your form…';
+      }
+    }
+
+    function checkForm(f) {
+      // Each rule checks that its own joints are clearly in view, so the whole body need not
+      // be: a bicep curl can be checked from the waist up.
+      if (!running || !formCheck || !f.smooth || !f.metrics) return;
+      const before = formCheck.judged;
+      const events = formCheck.update(f.smooth, f.metrics, f.t, f.landmarks);
+      if (before <= 15 && formCheck.judged > 15 && !events.length) showForm();
+      if (!events.length) return;
+      for (const ev of events) {
+        if (ev.type !== 'start') continue;
+        cur.feedback = ['warn', ev.cue];
+        if (!lastSaid[ev.id] || f.t - lastSaid[ev.id] > 6000) {
+          lastSaid[ev.id] = f.t;
+          voice.say(ev.cue);
+        }
+      }
+      showForm();
+      pushLive('active');
+      if (events.some((e) => e.type === 'start')) draw();
+    }
+
+    function onCamFrame(f) {
+      if (closed) return;
+      if (f.fullBody) camSeenAt = performance.now();
+      tracker.cameraFrame(f);
+      checkForm(f);
+      if (f.t - lastTable > 200) {
+        lastTable = f.t;
+        fillAngles(f);
+      }
+      if (f.t - lastCamMsg > 400) {
+        lastCamMsg = f.t;
+        const p = f.pred;
+        cam = { visible: f.visible, full: f.fullBody, active: p ? p.active : null, prob: p ? Math.round(p.prob * 100) : 0, label: p ? p.label : '', at: performance.now() };
+        showCam();
+      }
+    }
+
+    function startFormCam() {
+      if (formCam) return Promise.resolve(formCam);
+      if (!formStarting) {
+        formStarting = (async () => {
+          if (!DL.camera.supported()) throw new Error('This browser cannot use the camera.');
+          formRetry.hidden = true;
+          setFormStatus('Starting the camera…');
+          const c = await DL.camera.start({
+            video: camBox.querySelector('video'),
+            overlay: camBox.querySelector('canvas'),
+            onFrame: onCamFrame,
+            onStatus: (m) => m && setFormStatus(m),
+            showOverlay: showLines,
+            showAngles: true,
+          });
+          if (closed || formOff) {
+            c.stop();
+            throw new Error('The session has ended.');
+          }
+          camBox.classList.toggle('rear', !c.mirrored);
+          formCam = c;
+          setFormStatus('Tracking your limbs and joint angles. Video stays on this device.');
+          return c;
+        })();
+        formStarting.catch((e) => {
+          formStarting = null;
+          if (closed || formOff) return;
+          setFormStatus(e && e.name === 'NotAllowedError' ? 'Camera permission was refused, so your form is not being checked.' : `The camera could not start: ${e.message}`, true);
+          formRetry.hidden = false;
+          camLabel.textContent = 'Camera off';
+        });
+      }
+      return formStarting;
+    }
+
+    function stopFormCam() {
+      formOff = true;
+      if (formCam) formCam.stop();
+      formCam = null;
+    }
+
+    formCard.querySelector('#form-lines').onchange = (e) => {
+      showLines = e.target.checked;
+      try {
+        localStorage.setItem(LINES_KEY, showLines ? '1' : '0');
+      } catch {
+        /* not remembered, still applied */
+      }
+      if (formCam) formCam.setOverlay(showLines);
+    };
+    formRetry.onclick = () => startFormCam().catch(() => {});
+
     function showCam() {
       const st = steps[Math.min(idx, steps.length - 1)];
       let text = '', cls = '';
       if (!cam) text = 'Starting the camera…';
       else if (!cam.visible) [text, cls] = ['I can’t see you yet. Step into view.', 'warn'];
       else if (!cam.full) [text, cls] = ['Step back so I can see you from head to feet.', 'warn'];
-      else if (DLMotion.SIGNALS[st.name] && DLMotion.SIGNALS[st.name].missesSome && !cur) [text, cls] = ['The camera may miss some of these. Check the count, or use the wearable.', 'warn'];
+      else if (source === 'camera' && DLMotion.SIGNALS[st.name] && DLMotion.SIGNALS[st.name].missesSome && !cur) [text, cls] = ['The camera may miss some of these. Check the count, or use the wearable.', 'warn'];
       else if (cam.active === null) text = 'Watching…';
       else if (!cam.active) text = 'Ready. Start moving when you are.';
       else if (cam.label === st.name) [text, cls] = [`✓ ${st.name} · ${cam.prob}% sure`, 'good'];
@@ -360,44 +591,87 @@
       camLabel.className = `cam-label ${cls}`;
     }
 
-    const newSet = () => ({ reps: 0, partials: 0, tempo: [], rom: [], quality: [], hr: [], seconds: 0, feedback: null, hrHigh: false });
+    const newSet = () => ({ reps: 0, partials: 0, tempo: [], rom: [], quality: [], repLog: [], hr: [], seconds: 0, feedback: null, hrHigh: false, cheered: [], cheer: null, agree: { confirmed: 0, single: 0 } });
     const mean = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
 
     function pushLive(status) {
       const st = steps[Math.min(idx, steps.length - 1)];
-      api('POST', '/api/live', { participant_id: id, exercise: st.name, set: st.set, sets: st.sets, reps: st.unit === 'min' ? Math.floor(cur.seconds / 60) : cur.reps, target: st.target, quality: mean(cur.quality), hr: hrNow, status, source }).catch(() => {});
+      api('POST', '/api/live', { participant_id: id, exercise: st.name, set: st.set, sets: st.sets, reps: st.unit === 'min' ? Math.floor(cur.seconds / 60) : cur.reps, target: st.target, quality: mean(cur.quality), hr: hrNow, status, source, form: formActive().map((r) => r.cue).join(' · ') || null }).catch(() => {});
     }
 
-    // Voice coach: the count after each rep, plus the one cue that matters most.
+    // Encouragement part way through a set: halfway, and near the end of a long set
+    // (15+ reps, or timed). Each is said once per set; a set of 3 or fewer gets none.
+    const CHEERS = [[0.5, 'Good job! You’re halfway there.'], [0.9, 'Almost there. Great work!']];
+    let cheerTimer = null;
+    function cheerDue(st) {
+      const isMin = st.unit === 'min';
+      const total = isMin ? st.target * 60 : st.target;
+      const n = isMin ? cur.seconds : cur.reps;
+      if (!isMin && total <= 3) return null;
+      let due = null;
+      for (const [at, text] of CHEERS) {
+        if (at === 0.9 && !isMin && total < 15) continue;
+        if (n >= Math.ceil(total * at) && n < total && !cur.cheered.includes(at)) {
+          cur.cheered.push(at);
+          due = text;
+        }
+      }
+      if (due) {
+        cur.cheer = due;
+        clearTimeout(cheerTimer);
+        cheerTimer = setTimeout(() => {
+          if (cur && cur.cheer === due) {
+            cur.cheer = null;
+            draw();
+          }
+        }, 3500);
+      }
+      return due;
+    }
+
+    // Voice coach: the count after each rep, plus the one cue that matters most. A form or
+    // range warning comes before encouragement.
     function sayCount() {
       const st = steps[idx];
+      const cheer = cheerDue(st);
       if (cur.reps === st.target) voice.say(`${cur.reps}. Dose reached. Stop here.`);
       else if (cur.reps > st.target) voice.say(`${cur.reps}. Please stop.`);
       else if (cur.feedback && cur.feedback[0] === 'warn') voice.say(`${cur.reps}. ${cur.feedback[1]}`);
+      else if (cheer) voice.say(`${cur.reps}. ${cheer}`);
       else voice.say(String(cur.reps));
     }
 
     function onLine(line) {
       const f = line.split(',');
-      if (f[0] === 'CAM') {
-        cam = { visible: f[1] === '1', full: f[2] === '1', active: f[3] === '1' ? true : f[3] === '0' ? false : null, prob: Number(f[4]) || 0, label: f.slice(5).join(','), at: performance.now() };
-        return showCam();
-      }
+      const t = performance.now();
       if (f[0] === 'SPO2') {
         spo2Now = Number(f[1]) || null;
+        bio.spo2(spo2Now, t);
+        evaluate();
         return draw();
       }
       if (f[0] === 'HR') {
         hrNow = Number(f[1]) || null;
         if (running && hrNow) cur.hr.push(hrNow);
-        if (hrNow && hrNow > p.hr_max && cur) {
-          if (!cur.hrHigh) voice.say('Your heart rate is high. Stop and rest.', true);
-          cur.hrHigh = true;
-        }
-        if (hrNow && hrNow <= p.hr_max - 5 && cur) cur.hrHigh = false;
+        bio.hr(hrNow, t);
+        evaluate();
         return draw();
       }
+      if (f[0] === 'DATA') {
+        // The watch's status line, once a second: its accelerometer tells the heart-rate
+        // reading whether the wrist was still, and "finger" whether the pulse sensor has contact.
+        const kv = Object.fromEntries(f.slice(1).map((x) => x.split('=')));
+        bio.accel(Number(kv.ax), Number(kv.ay), Number(kv.az), t);
+        if (kv.pulse === 'ok') bio.contact(kv.finger === '1', t);
+        return;
+      }
       if (f[0] === 'LOST') {
+        if (source === 'fused') {
+          // The camera can carry on alone.
+          toast('The watch was disconnected. The camera keeps counting.', true);
+          tracker.dropSerial();
+          return draw();
+        }
         toast('The sensor was disconnected. You can keep going by counting by hand.', true);
         tracker.close();
         source = 'manual';
@@ -406,24 +680,104 @@
       if (f[0] === 'SET' && f[1] === 'START' && !running) return beginSet(true); // button on the wearable
       if (f[0] === 'SET' && f[1] === 'STOP' && running) return finishSet(true);
       if (!running) return;
-      const st = steps[idx];
-      if (f[0] === 'REP') {
-        cur.reps = Number(f[1]);
-        cur.tempo.push(Number(f[2]));
-        cur.rom.push(Number(f[3]));
-        cur.quality.push(Number(f[4]));
-        if (Number(f[3]) < st.target_rom_deg * 0.8) cur.feedback = ['warn', 'Try to move through the full range'];
-        else if (Number(f[2]) < st.target_tempo_ms * 0.7) cur.feedback = ['warn', 'Slow down and control the movement'];
-        else cur.feedback = ['good', 'Good rep'];
-        sayCount();
-        pushLive('active');
-        draw();
-      } else if (f[0] === 'PART') {
-        cur.partials++;
-        cur.feedback = ['warn', 'Too shallow to count. Go a little further'];
-        voice.say('Go a little further.');
-        draw();
+      if (source === 'fused') {
+        // Watch lines and camera ("CAM,") lines both go through the matcher, which says what counts.
+        const cam = f[0] === 'CAM';
+        const g = cam ? f.slice(1) : f;
+        if (!fusion || (g[0] !== 'REP' && g[0] !== 'PART')) return;
+        bio.moved(t);
+        const rep = g[0] === 'PART' ? { partial: true, rom: Number(g[1]) } : { tempo: g[2] === '' ? null : Number(g[2]), rom: Number(g[3]), quality: Number(g[4]) };
+        return fusedEvents(fusion.add(cam ? 'camera' : 'watch', rep, t));
       }
+      if (f[0] === 'REP') {
+        bio.moved(t);
+        applyRep(Number(f[1]), f[2] === '' ? null : Number(f[2]), Number(f[3]), Number(f[4]));
+      } else if (f[0] === 'PART') {
+        bio.moved(t);
+        applyPartial();
+      }
+    }
+
+    // What the matcher decided: count a rep, report a shallow one, or note agreement.
+    function fusedEvents(events) {
+      let redraw = false;
+      for (const ev of events) {
+        if (ev.type === 'rep') {
+          if (ev.kind === 'confirmed') cur.agree.confirmed++;
+          applyRep(ev.count, ev.tempo, ev.rom, ev.quality);
+        } else if (ev.type === 'partial') applyPartial();
+        else if (ev.type === 'confirm') {
+          cur.agree.confirmed++;
+          redraw = true;
+        } else if (ev.type === 'unconfirmed' || ev.type === 'possible' || ev.type === 'rejected') {
+          cur.agree.single++;
+          redraw = true;
+        }
+      }
+      if (redraw) draw();
+    }
+
+    function applyRep(count, tempo, rom, quality) {
+      const st = steps[idx];
+      cur.reps = count;
+      if (tempo !== null) cur.tempo.push(tempo);
+      cur.rom.push(rom);
+      cur.quality.push(quality);
+      cur.repLog.push({ rom, tempo, quality });
+      // The camera's first rep of a set may be measured from part of a movement already
+      // under way, so its range and pace are not judged.
+      const judge = !(source === 'camera' && cur.reps === 1);
+      if (!judge) cur.feedback = ['good', 'Good rep'];
+      else if (rom < st.target_rom_deg * 0.8) cur.feedback = ['warn', 'Try to move through the full range'];
+      else if (tempo !== null && tempo < st.target_tempo_ms * 0.7) cur.feedback = ['warn', 'Slow down and control the movement'];
+      else cur.feedback = ['good', 'Good rep'];
+      const fault = formActive()[0];
+      if (fault) cur.feedback = ['warn', fault.cue];
+      evaluate();
+      sayCount();
+      pushLive('active');
+      draw();
+    }
+
+    function applyPartial() {
+      cur.partials++;
+      cur.feedback = ['warn', 'Too shallow to count. Go a little further'];
+      voice.say('Go a little further.');
+      draw();
+    }
+
+    // Who can count right now: the watch while its lines keep coming, the camera while it
+    // sees the whole body. Said aloud when it changes, so a lost sensor is never silent.
+    const FMODE_SAY = {
+      watch: 'The camera can’t see you. The watch is counting.',
+      camera: 'The watch has gone quiet. The camera is counting.',
+      both: 'Watch and camera are both counting again.',
+      none: 'I’ve lost track of you. Step into view, or count by hand.',
+    };
+    function fusionHealth(t) {
+      if (!fusion) return false;
+      fusion.setHealth({ watch: !!tracker.port && t - (tracker.lastLineAt || 0) < fcfg.watchLostMs, camera: !!formCam && t - camSeenAt < fcfg.camLostMs });
+      const m = fusion.mode();
+      if (m === fmode) return false;
+      fmode = m;
+      voice.say(FMODE_SAY[m], m === 'none');
+      return true;
+    }
+
+    // A few times a second during a set: sensor health, reps the other sensor never
+    // confirmed, and readings that only stop a set if they persist.
+    function startSafetyTick() {
+      clearInterval(safetyTick);
+      safetyTick = setInterval(() => {
+        if (closed || !running || !cur) return;
+        const t = performance.now();
+        let redraw = false;
+        if (source === 'fused' && fusion) {
+          redraw = fusionHealth(t);
+          fusedEvents(fusion.tick(t));
+        }
+        if (evaluate() || redraw) draw();
+      }, 250);
     }
 
     // The wearable needs the exercise's targets before a set starts, including one
@@ -437,14 +791,31 @@
       }
     }
 
-    function beginSet(fromDevice) {
+    // calibrating: a short set (about 6 slow, full reps) that measures how the watch and
+    // camera line up for this person and exercise. It is not saved as part of the dose.
+    function beginSet(fromDevice, { calibrating = false } = {}) {
       const st = steps[idx];
       cur = newSet();
+      cur.calibrating = calibrating;
+      calib = null;
+      restOverride = false;
+      formCheck = new DLMotion.FormChecker(st.name);
       running = true;
+      bio.spo2Min = null;
+      safety = { level: 'ok', reasons: [] };
+      if (source === 'fused') {
+        fusion = new DLFusion.RepFusion(st.name, { cfg: fcfg, tempoMs: st.target_tempo_ms });
+        fmode = 'both';
+        fusionHealth(performance.now());
+        if (fromDevice) tracker.camCommand('START'); // started from the watch's own button
+      } else fusion = null;
+      startSafetyTick();
       if (st.unit === 'min') {
         timer = setInterval(() => {
           if (source === 'camera' && !camActive()) return; // only time the camera sees moving counts
           cur.seconds++;
+          const cheer = cheerDue(st);
+          if (cheer) voice.say(cheer);
           if (cur.seconds % 60 === 0) pushLive('active');
           draw();
         }, 1000);
@@ -461,7 +832,21 @@
       const st = steps[idx];
       running = false;
       clearInterval(timer);
+      clearInterval(safetyTick);
       if (st.unit === 'reps' && source !== 'manual' && fromDevice !== true) tracker.send('STOP');
+      else if (source === 'fused' && fromDevice === true) tracker.camCommand('STOP'); // stopped from the watch
+      const fz = source === 'fused' && fusion ? fusion.finish() : null;
+      if (cur.calibrating) {
+        calib = DLFusion.calibrate(fusion ? fusion.raw : {}, { exercise: st.name, tempoMs: st.target_tempo_ms, cfg: fcfg });
+        voice.say(calib.ok ? 'Calibration done. Check the result and save it.' : 'Calibration did not work. Have a look at the screen.');
+        fusion = null;
+        cur = null;
+        formCheck = null;
+        shown = -1;
+        lastFrac = 0;
+        tint();
+        return draw();
+      }
       const sensed = st.unit === 'reps' && source !== 'manual';
       const done = st.unit === 'min' ? Math.round(cur.seconds / 60) : cur.reps;
       try {
@@ -476,6 +861,10 @@
           hr_avg: mean(cur.hr),
           hr_peak: cur.hr.length ? Math.max(...cur.hr) : null,
           source: st.unit === 'min' && source !== 'camera' ? 'manual' : source,
+          // Only when the camera saw the whole body for a few seconds of the set (~30 frames/s).
+          form_issues: formCheck && formCheck.rules.length && formCheck.judged >= 60 ? formCheck.counts : null,
+          fusion: fz,
+          spo2_min: bio.spo2Min,
         });
       } catch (e) {
         running = true; // keep the numbers on screen so the set can be saved again
@@ -488,6 +877,9 @@
     function next() {
       idx++;
       cur = null;
+      fusion = null;
+      calib = null;
+      formCheck = null;
       shown = -1;
       lastFrac = 0;
       if (idx >= steps.length) return checkIn();
@@ -498,7 +890,41 @@
 
     const stepper = () => `<div class="progress-steps" aria-hidden="true">${steps.map((_, i) => `<i class="${i < idx ? 'done' : i === idx ? 'cur' : ''}"></i>`).join('')}</div>`;
 
-    const SOURCES = [['camera', 'camera', 'Camera'], ['device', 'sensor', 'Wearable'], ['sim', 'spark', 'Demo sensor'], ['manual', 'hand', 'By hand']];
+    const SOURCES = [['fused', 'sensor', 'Watch + camera'], ['camera', 'camera', 'Camera'], ['device', 'sensor', 'Wearable'], ['sim', 'spark', 'Demo sensor'], ['manual', 'hand', 'By hand']];
+
+    // Before a set, with watch + camera: who counts this exercise, its calibration, and the
+    // result of a calibration just run.
+    function fusedPanel(st) {
+      const m = DLFusion.exerciseSettings(fcfg, st.name, st.target_tempo_ms);
+      const e = fcfg.exercises[st.name];
+      let h = `<p class="muted small" style="margin:10px 4px 0">The <b>${m.primary}</b> counts this exercise and the ${m.primary === 'watch' ? 'camera' : 'watch'} checks each rep. If one loses track, the other takes over. Wear the watch snug on your wrist and stand where the camera sees all of you.</p>
+        <div class="fz-cal row spread"><span class="small">${e && e.calibratedAt ? `${icon('check')} Calibrated ${fmtDate(e.calibratedAt)}` : `${icon('alert')} Not calibrated for you yet`}</span><button id="calib" class="ghost">${icon('target')} ${e && e.calibratedAt ? 'Calibrate again' : 'Calibrate'}</button></div>`;
+      if (calib) {
+        h += `<div class="fz-result ${calib.ok ? 'good' : 'bad'}" role="status">
+          <b>${calib.ok ? 'Calibration result' : 'Calibration did not work'}</b>
+          <p>${esc(calib.message)}</p>
+          <dl class="kv small"><dt>Watch saw</dt><dd>${calib.watchReps} reps</dd><dt>Camera saw</dt><dd>${calib.cameraReps} reps</dd><dt>Matched</dt><dd>${calib.pairs}${calib.agreement != null ? ` (${calib.agreement}%)` : ''}</dd>
+          ${calib.offsetMs != null ? `<dt>Camera delay</dt><dd>${calib.offsetMs} ms</dd><dt>Match window</dt><dd>±${calib.windowMs} ms</dd>` : ''}
+          ${calib.romScale ? `<dt>Range ratio</dt><dd>${calib.romScale}</dd>` : ''}
+          ${calib.suggestedPrimary ? `<dt>Best counter</dt><dd>${calib.suggestedPrimary}</dd>` : ''}</dl>
+          <div class="row">${calib.ok ? `<button id="calib-save" class="primary">${icon('check')} Save calibration</button>` : ''}<button id="calib-again">Try again</button><button id="calib-drop" class="ghost">Discard</button></div>
+        </div>`;
+      }
+      return h;
+    }
+
+    // During a set with watch + camera: who is counting and how well they agree.
+    function fusedStatus() {
+      if (!fusion) return '';
+      const ok = (s) => fusion.health[s];
+      const a = cur.agree;
+      const seen = a.confirmed + a.single;
+      return `<div class="fz-status ${fmode === 'none' ? 'bad' : fmode !== 'both' ? 'warn' : ''}" aria-live="polite">
+        <span class="${ok('watch') ? 'on' : 'off'}">${icon('sensor')} Watch ${ok('watch') ? '✓' : 'lost'}</span>
+        <span class="${ok('camera') ? 'on' : 'off'}">${icon('camera')} Camera ${ok('camera') ? '✓' : 'can’t see you'}</span>
+        <span class="muted">${fmode === 'both' ? `${fusion.primary} counts` : fmode === 'none' ? 'nobody can count' : `${fmode} counting alone`}${seen ? ` · ${a.confirmed} of ${seen} reps seen by both` : ''}</span>
+      </div>`;
+    }
 
     function draw() {
       if (closed || idx >= steps.length) return;
@@ -513,7 +939,8 @@
       shown = n;
       const fromFrac = lastFrac;
       lastFrac = frac;
-      const fb = cur && cur.feedback ? `<div class="feedback ${cur.feedback[0]}">${icon(cur.feedback[0] === 'good' ? 'check' : 'alert')} ${esc(cur.feedback[1])}</div>` : `<div class="feedback idle">${running ? (isMin ? 'Keep a steady, comfortable pace' : source === 'manual' ? 'Tap +1 after each repetition' : 'Begin when you are ready') : 'Ready when you are'}</div>`;
+      const rest = idx > 0 || cur ? bio.recovery() : null;
+      const fb = cur && cur.calibrating && !cur.feedback ? `<div class="feedback idle">Calibrating: do 6 slow, full reps, then tap Finish</div>` : cur && cur.feedback ?`<div class="feedback ${cur.feedback[0]}">${icon(cur.feedback[0] === 'good' ? 'check' : 'alert')} ${esc(cur.feedback[1])}</div>` : `<div class="feedback idle">${running ? (isMin ? 'Keep a steady, comfortable pace' : source === 'manual' ? 'Tap +1 after each repetition' : 'Begin when you are ready') : 'Ready when you are'}</div>`;
 
       el.innerHTML = `
         ${stepper()}
@@ -523,14 +950,22 @@
           <p class="muted">${esc(st.cue)}${st.load ? ` <b style="color:var(--ink)">${esc(st.load)}.</b>` : ''}</p>
         </div>
 
-        ${cur && cur.hrHigh ? `<div class="banner alert" role="alert">${icon('heart')}<span>Your heart rate is high. Stop and rest until it settles.</span></div>` : ''}
+        ${cur && cur.cheer ? `<div class="cheer" role="status">${icon('spark')} ${esc(cur.cheer)}</div>` : ''}
+        ${(() => {
+          // The most serious safety reason that is not already shown elsewhere (form cues
+          // are in the feedback line, the dose banner is below).
+          const r = running && safety.reasons.find((x) => !x.code.startsWith('form:') && x.code !== 'overdose');
+          return r ? `<div class="banner ${r.level === 'stop' ? 'alert' : 'warn'}" role="alert">${icon(r.code.startsWith('hr') ? 'heart' : 'alert')}<span>${esc(r.text)}</span></div>` : '';
+        })()}
+        ${!running && rest && !rest.ready && !restOverride ? `<div class="banner warn" role="status">${icon('heart')}<span>Rest a little longer: heart rate ${rest.hr} bpm. Start the next set when it is under ${rest.under}.</span></div>` : ''}
         ${over ? `<div class="banner alert" role="alert">${icon('alert')}<span>You are well past your dose. Please stop this set now.</span></div>` : reached ? `<div class="banner good" role="status">${icon('check')}<span>Dose reached. ${isMin ? 'You can stop here.' : 'Stop here and finish the set.'}</span></div>` : ''}
 
         ${
           !running
             ? `<div class="card" style="padding:16px"><h3 style="margin:2px 4px 10px">${isMin ? 'How shall we time it?' : 'How shall we count?'}</h3>
             <div class="seg" role="group" aria-label="Counting method">${(isMin ? SOURCES.filter(([k]) => k === 'camera' || k === 'manual').map(([k, ic, t]) => [k, ic, k === 'manual' ? 'Timer' : t]) : SOURCES).map(([k, ic, t]) => `<button data-src="${k}" class="${source === k ? 'on' : ''}" aria-pressed="${source === k}">${icon(ic)}${t}</button>`).join('')}</div>
-            <p class="muted small" style="margin:10px 4px 0">${
+            ${source === 'fused' && !isMin ? fusedPanel(st) : ''}
+            <p class="muted small" style="margin:10px 4px 0" ${source === 'fused' && !isMin ? 'hidden' : ''}>${
               source === 'camera'
                 ? `The camera watches the movement and counts for you. Prop your phone up so your whole body is in view. <b>Video stays on this device</b>; only joint angles are used.`
                 : isMin
@@ -547,29 +982,38 @@
         <div class="card stage">
           <div class="stage-grid">${fig.ok || source === 'camera' ? `<div id="fig-slot" class="fig-slot ${source === 'camera' ? 'cam-slot' : ''}"></div>` : ''}<div aria-live="polite">${ring(frac, { size: 250, w: 18, cls: (over ? 'alert' : reached ? 'good' : 'accent') + (popped ? ' pulse' : ''), from: fromFrac, inner: `<span class="n ${isMin ? 'time' : ''} ${popped ? 'pop' : ''}">${isMin ? mmss : n}</span><span class="of">of ${isMin ? `${st.target} min` : `${st.target} reps`}</span>` })}</div>
           </div>
+          ${running && source === 'fused' ? fusedStatus() : ''}
           <div>${fb}</div>
           ${
             !running
-              ? `<button class="primary big" id="go">${icon('play')} Start ${isMin ? 'timer' : 'set'}</button>`
+              ? rest && !rest.ready && !restOverride
+                ? `<button class="big" id="go" disabled>${icon('heart')} Resting… ${rest.hr} bpm</button><p style="text-align:center;margin:8px 0 0"><button id="go-anyway" class="ghost small">Start anyway</button></p>`
+                : `<button class="primary big" id="go">${icon('play')} Start ${isMin ? 'timer' : 'set'}</button>`
               : `${!isMin && source === 'manual' ? '<div class="row" style="margin-bottom:12px;flex-wrap:nowrap"><button id="minus" style="flex:1" aria-label="Remove one repetition">−1</button><button class="primary" id="plus" style="flex:3;font-size:1.7rem">+1</button></div>' : ''}
                  ${isMin ? `<p><button id="plusmin" class="ghost">${icon('plus')} Add 1 minute done away from the screen</button></p>` : ''}
-                 <button class="${reached ? 'primary ' : ''}big" id="finish">${icon('check')} Finish ${isMin ? '' : 'set'}</button>`
+                 <button class="${reached || (cur && cur.calibrating) ? 'primary ' : ''}big" id="finish">${icon('check')} Finish ${cur && cur.calibrating ? 'calibration' : isMin ? '' : 'set'}</button>`
           }
         </div>
+        <div id="form-slot"></div>
         ${!running ? `<p style="text-align:center"><button id="skip" class="ghost">Skip this set ${icon('next')}</button> <button id="quit" class="ghost danger">End session early</button></p>` : ''}`;
       // Before a set the figure demonstrates the movement on a loop; during a counted
       // set it performs one repetition each time a rep is counted.
+      // The camera video sits in the stage when it is counting, otherwise in the form camera card.
       const slot = el.querySelector('#fig-slot');
       if (slot) slot.appendChild(source === 'camera' ? camBox : figCanvas);
-      if (source === 'camera') {
-        showCam();
-        drawCamHud(st, popped);
-      }
+      el.querySelector('#form-slot').replaceWith(formCard);
+      if (source !== 'camera') formCard.querySelector('.form-cam-slot').appendChild(camBox);
+      camBox.classList.toggle('form', source !== 'camera');
+      showCam();
+      showForm();
+      if (source === 'camera') drawCamHud(st, popped);
+      else camHud.hidden = true;
       fig.set(st.name, source === 'manual' ? '' : st.sensor_site);
       fig.mode(running && !isMin ? 'manual' : 'loop');
       if (popped) fig.pulse(Math.min(st.target_tempo_ms || 2000, 1600));
       // Only the first draw of a step animates in; redraws during a set must not replay it.
       el.classList.toggle('still', !fresh);
+      tint();
       fresh = false;
 
       el.querySelectorAll('[data-src]').forEach((b) => (b.onclick = act(() => pickSource(b.dataset.src))));
@@ -578,7 +1022,30 @@
         if (b) b.onclick = fn;
       };
       on('#go', () => beginSet(false));
+      on('#go-anyway', () => {
+        restOverride = true;
+        draw();
+      });
       on('#finish', () => finishSet(false));
+      on('#calib', () => beginSet(false, { calibrating: true }));
+      on('#calib-again', () => beginSet(false, { calibrating: true }));
+      on('#calib-drop', () => {
+        calib = null;
+        draw();
+      });
+      on(
+        '#calib-save',
+        act(async () => {
+          const saved = DLFusion.applyCalibration(p.fusion, calib);
+          await api('PUT', `/api/participants/${id}/fusion`, { settings: saved, calibrated: st.name });
+          p.fusion = saved;
+          fcfg = DLFusion.settings(saved);
+          bio.cfg = fcfg;
+          calib = null;
+          toast(`Calibration saved for ${st.name}`);
+          draw();
+        })
+      );
       on('#voice', () => {
         voice.on = !voice.on;
         voice.say('Voice coach on. I will count your repetitions.');
@@ -610,19 +1077,29 @@
         if (!DL.camera.supported()) throw new Error('This browser cannot use the camera. Try Chrome or Safari on your phone.');
         await tracker.close();
         hrNow = null;
-        cam = null;
         source = 'camera';
         draw(); // show the camera panel while it starts
         try {
-          await tracker.useCamera(camBox, (msg) => {
-            if (msg) camLabel.textContent = msg;
-          });
+          await startFormCam();
         } catch (e) {
           source = 'manual';
           draw();
           throw new Error(e && e.name === 'NotAllowedError' ? 'Camera permission was refused. You can count by hand instead.' : `The camera could not start: ${e.message}`);
         }
-        if (closed) return tracker.close();
+        if (closed) return;
+        tracker.useCamera();
+      } else if (nextSource === 'fused') {
+        if (!Tracker.serialSupported) throw new Error('This browser cannot talk to the watch. Use Chrome or Edge on a computer.');
+        await tracker.close();
+        try {
+          await tracker.useFused();
+        } catch (e) {
+          if (e.name === 'NotFoundError') return; // chooser dismissed
+          throw new Error('Could not open the watch. Check the USB cable and that no other program is using it.');
+        }
+        // The camera is usually already running for form checks; if it cannot start, the
+        // watch counts alone and the status line says so.
+        startFormCam().catch(() => toast('The camera could not start, so the watch counts alone.', true));
       } else if (nextSource === 'device') {
         if (!Tracker.serialSupported) throw new Error('This browser cannot talk to the sensor. Use Chrome or Edge on a computer, or count by hand.');
         await tracker.close();
@@ -644,6 +1121,10 @@
 
     function checkIn() {
       idx = steps.length;
+      running = false;
+      clearInterval(safetyTick);
+      tint();
+      stopFormCam();
       el.classList.remove('still');
       let rpe = null;
       let pain = null;
@@ -724,8 +1205,16 @@
 
     cur = null;
     draw();
+    // Reps are counted by the camera unless it cannot start; then counting by hand is the
+    // fallback, and the form camera card says why and offers to try again.
+    if (DL.camera.supported()) pickSource('camera').catch((e) => toast(e.message, true));
+    else startFormCam().catch(() => {});
     return () => {
       closed = true;
+      clearTimeout(cheerTimer);
+      clearInterval(safetyTick);
+      document.documentElement.classList.remove('exercising', 'tint-warn', 'tint-alert');
+      stopFormCam();
       fig.destroy();
       clearInterval(timer);
       tracker.close();
