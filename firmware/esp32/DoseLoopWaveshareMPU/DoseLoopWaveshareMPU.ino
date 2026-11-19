@@ -763,12 +763,18 @@ void drawWatch() {
     textC(buf, SW / 2, 196, F_BIG, 2, hrHigh ? ALERT : INK);
     textC(hrHigh ? "bpm  -  rest now" : "bpm", SW / 2, 216, F_SMALL, 1, hrHigh ? ALERT : MUTED);
   } else {
-    textC("--", SW / 2, 186, F_BIG, 1, TRACK);
-    const char *hint = !oxOk ? "Pulse sensor not found"
-                     : !finger ? "Rest a finger on the sensor"
-                     : pulse.moving ? "Hold your finger still"
-                     : "Reading your pulse...";
-    centered(hint, 204, 1, !oxOk ? ALERT : finger ? WARN : MUTED);
+    textC("--", SW / 2, 178, F_BIG, 1, TRACK);
+    if (oxOk && pulse.contact) {
+      // Finger on the sensor: show how far through the first reading it is (about 6.5 s of
+      // steady signal), so people know to keep still rather than lift too soon.
+      float prog = (float)(oxTf - pulse.settleT) / 6500.0f;
+      prog = prog < 0 ? 0 : prog > 1 ? 1 : prog;
+      centered(pulse.moving ? "Keep still..." : "Measuring... keep still", 194, 1, WARN);
+      gfx->fillRoundRect(26, 208, 120, 6, 3, TRACK);
+      if (prog > 0.02f) gfx->fillRoundRect(26, 208, (int)(120 * prog), 6, 3, ACCENT);
+    } else {
+      centered(!oxOk ? "Pulse sensor not found" : "Rest a finger on the sensor", 200, 1, !oxOk ? ALERT : MUTED);
+    }
   }
 
   // Oxygen card.
