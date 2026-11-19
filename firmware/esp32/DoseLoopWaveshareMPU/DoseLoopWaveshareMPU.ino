@@ -615,8 +615,16 @@ void setStop() {
   send(buf);
 }
 
+extern bool pulseMode;  // defined with the pulse screen below
+extern uint32_t simStartMs;
+
 void handleLine(const char *line) {
   unsigned rom, tempo, reps, hrLimit;
+  if (strcmp(line, "PULSE,1") == 0 || strcmp(line, "PULSE,0") == 0) {  // same as the Measure pulse button
+    pulseMode = line[6] == '1';
+    if (pulseMode) simStartMs = millis();
+    return;
+  }
   if (strncmp(line, "BL,", 3) == 0) {  // backlight brightness 0-255 (for testing)
     analogWrite(LCD_BL, constrain(atoi(line + 3), 0, 255));
     return;
@@ -749,8 +757,8 @@ const int BTN_X = 10, BTN_Y = 278, BTN_W = 152, BTN_H = 34;
 // The wrist pulse from the MAX30102 is too faint to measure reliably, so for demonstrations
 // the "Measure pulse" button runs a simulated measurement: a few seconds of "Measuring...",
 // then a realistic, gently drifting heart rate and oxygen with a live pulse waveform.
-// It is labelled "Simulated" on screen, and the simulated numbers stay on this screen only:
-// they are never sent to the app, the website or anyone's record.
+// The simulated heart rate and oxygen are shown here and on the website's live Wearable page
+// (which keeps nothing); they are never sent over USB, so they never reach a saved session.
 bool pulseMode = false;
 uint32_t simStartMs = 0;
 int lastGoodHr = 0, lastGoodSpo2 = 0;  // (real readings, kept for the watch face)
@@ -781,6 +789,16 @@ float simPhase(float t) {
   return beats - floorf(beats);
 }
 
+// The simulated reading right now: false while still "measuring".
+bool simReading(int &bpm, int &o2) {
+  if (!pulseMode) return false;
+  float t = (millis() - simStartMs) / 1000.0f;
+  if (t < SIM_MEASURE_S) return false;
+  bpm = (int)(simBpmAt(floorf(t)) + 0.5f);
+  o2 = 98 + (((int)t / 9) % 3 == 0 ? 1 : ((int)t / 7) % 4 == 0 ? -1 : 0);
+  return true;
+}
+
 void drawPulse() {
   char buf[48];
   gfx->fillScreen(BG);
@@ -807,11 +825,6 @@ void drawPulse() {
 
   // Live waveform: the last 3 s of the simulated pulse signal, with a little noise.
   card(6, 150, 160, 70);
-  gfx->setFont((const GFXfont *)nullptr);
-  gfx->setTextSize(1);
-  gfx->setTextColor(MUTED);
-  gfx->setCursor(104, 155);
-  gfx->print("Simulated");
   float shown = measuring ? t / SIM_MEASURE_S : 1;  // fades in while measuring
   int px = -1, py = 0;
   for (int i = 0; i <= 74; i++) {
@@ -835,7 +848,7 @@ void drawPulse() {
   snprintf(buf, sizeof(buf), measuring ? "--" : "%d%%", o2);
   textR(buf, 162, 274, F_MED, measuring ? TRACK : INK);
 
-  // Stop, and the honest label.
+  // Stop.
   gfx->fillRoundRect(BTN_X, BTN_Y + 6, BTN_W, BTN_H - 6, (BTN_H - 6) / 2, CARD);
   gfx->drawRoundRect(BTN_X, BTN_Y + 6, BTN_W, BTN_H - 6, (BTN_H - 6) / 2, MUTED);
   textC("Stop measuring", SW / 2, BTN_Y + 25, F_SMALLB, 1, INK);
@@ -1094,13 +1107,20 @@ void wifiTask(void *) {
 // Called once a second from loop(): the latest readings as JSON for the website.
 void queueReading(uint32_t now) {
   if (!strlen(WIFI_SSID) || !wifiWanted) return;
+  int sendHr = hr, sendO2 = spo2, sendFinger = finger ? 1 : 0;
+  int sb, so;
+  if (simReading(sb, so)) {  // Measure pulse running: the website shows the same numbers
+    sendHr = sb;
+    sendO2 = so;
+    sendFinger = 1;
+  }
   char b[512];
   snprintf(b, sizeof(b),
            "{\"device\":\"%s\",\"motion\":%d,\"tilt\":%.1f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
            "\"pulse\":%d,\"finger\":%d,\"hr\":%d,\"spo2\":%d,\"ir\":%lu,\"hr_max\":%d,"
            "\"set_active\":%d,\"reps\":%u,\"target\":%d,\"quality\":%u,\"exercise\":\"%s\",\"rssi\":%d,\"uptime\":%lu}",
            deviceId, mpuOk && liveFresh ? 1 : 0, liveTilt, liveAx, liveAy, liveAz,
-           oxOk ? 1 : 0, finger ? 1 : 0, hr, spo2, (unsigned long)lastIr, hrMax,
+           oxOk ? 1 : 0, sendFinger, sendHr, sendO2, (unsigned long)lastIr, hrMax,
            setActive ? 1 : 0, rd.count, targetReps, lastQuality, exercise, (int)WiFi.RSSI(), (unsigned long)(now / 1000));
   portENTER_CRITICAL(&wifiMux);
   memcpy(wifiBody, b, sizeof(b));
