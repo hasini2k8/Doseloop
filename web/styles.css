@@ -820,3 +820,18 @@ html.exercising.tint-alert::after { background: rgba(214, 48, 39, .13); box-shad
 .cheer .ic { font-size: 1.4em; }
 @keyframes cheerIn { from { transform: scale(.85) translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .cheer { animation: none; } html::after { transition: none; } }
+
+/* Watch + camera: calibration before a set, who is counting during it */
+.fz-cal { margin: 12px 4px 0; padding: 10px 14px; border-radius: 12px; background: var(--surface-2); gap: 10px; }
+.fz-cal .ic { vertical-align: -3px; }
+.fz-result { margin: 12px 4px 0; padding: 14px 16px; border-radius: 14px; border: 2px solid var(--line); }
+.fz-result.good { border-color: var(--good); }
+.fz-result.bad { border-color: var(--alert); background: var(--alert-soft); }
+.fz-result p { margin: 6px 0 10px; }
+.fz-result .kv { margin: 0 0 12px; }
+.fz-status { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 18px; margin: 0 0 12px; padding: 8px 14px; border-radius: 12px; background: var(--surface-2); font-weight: 600; font-size: .92rem; }
+.fz-status .on { color: var(--good); }
+.fz-status .off { color: var(--alert); }
+.fz-status.warn { background: var(--warn-soft); }
+.fz-status.bad { background: var(--alert-soft); }
+.fz-status .ic { vertical-align: -3px; }
