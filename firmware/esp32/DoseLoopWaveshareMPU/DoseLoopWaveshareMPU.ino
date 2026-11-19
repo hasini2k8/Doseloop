@@ -297,6 +297,8 @@ struct PulseDetector {
       dcRed = baseRed = red;
       lpIr = lpRed = 0;
       head = count = sinceEstimate = 0;
+      nRatio = 0;  // oxygen measured before the shift no longer applies
+      spo2 = 0;
       settleT = t_ms;
       moving = true;
     }
@@ -413,7 +415,9 @@ struct PulseDetector {
     // SpO2: R = (red pulse / red level) / (infrared pulse / infrared level), with the red pulse
     // measured as how strongly it follows the infrared one (sensor noise averages out).
     float R = (sxy / sxx) * dcIr / dcRed;
-    if (R > 0.2f && R < 1.8f) {
+    // Oxygen only from very clear stretches: a muddier rhythm still gives a sound heart rate,
+    // but the red/infrared ratio is easily skewed by movement.
+    if (quality >= 0.55f && R > 0.2f && R < 1.8f) {
       for (int k = 4; k > 0; k--) ratioHist[k] = ratioHist[k - 1];
       ratioHist[0] = R;
       if (nRatio < 5) nRatio++;
@@ -1007,6 +1011,23 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   send("HELLO,DOSELOOP,1");
+  {
+    // Why the board last restarted: tells a power problem from a software crash.
+    const char *why;
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON: why = "power_on"; break;
+      case ESP_RST_BROWNOUT: why = "brownout_power_dip"; break;
+      case ESP_RST_PANIC: why = "crash"; break;
+      case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: why = "watchdog_freeze"; break;
+      case ESP_RST_SW: why = "software_restart"; break;
+      case ESP_RST_USB: why = "usb_reset"; break;
+      case ESP_RST_EXT: why = "reset_button"; break;
+      default: why = "other"; break;
+    }
+    char b[48];
+    snprintf(b, sizeof(b), "BOOT,reason=%s", why);
+    send(b);
+  }
   Wire.begin(I2C_SDA, I2C_SCL, 100000);  // 100 kHz: copes better with jumper wires
   pinMode(LCD_RST, OUTPUT);  // reset the screen
   digitalWrite(LCD_RST, LOW);

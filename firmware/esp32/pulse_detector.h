@@ -85,6 +85,8 @@ struct PulseDetector {
       dcRed = baseRed = red;
       lpIr = lpRed = 0;
       head = count = sinceEstimate = 0;
+      nRatio = 0;  // oxygen measured before the shift no longer applies
+      spo2 = 0;
       settleT = t_ms;
       moving = true;
     }
@@ -201,7 +203,9 @@ struct PulseDetector {
     // SpO2: R = (red pulse / red level) / (infrared pulse / infrared level), with the red pulse
     // measured as how strongly it follows the infrared one (sensor noise averages out).
     float R = (sxy / sxx) * dcIr / dcRed;
-    if (R > 0.2f && R < 1.8f) {
+    // Oxygen only from very clear stretches: a muddier rhythm still gives a sound heart rate,
+    // but the red/infrared ratio is easily skewed by movement.
+    if (quality >= 0.55f && R > 0.2f && R < 1.8f) {
       for (int k = 4; k > 0; k--) ratioHist[k] = ratioHist[k - 1];
       ratioHist[0] = R;
       if (nRatio < 5) nRatio++;
