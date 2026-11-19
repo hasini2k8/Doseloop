@@ -538,6 +538,70 @@ function createApp(db, ai = createAi()) {
     return { ok: true };
   });
 
+  // ---------- wearable over Wi-Fi ----------
+  // The ESP32 wearable posts its live readings here about once a second; the Wearable page
+  // reads them back. Kept in memory only (the last 5 minutes per device): these are live
+  // readings for watching, not part of anyone's record. Sets still reach the record through
+  // the app's "Wearable" option over USB. If DEVICE_KEY is set, devices must send it as "key".
+  const devices = new Map();
+  const DEVICE_HISTORY = 300;
+  const num = (v, lo, hi) => {
+    const n = Number(v);
+    return v === null || v === undefined || v === '' || !Number.isFinite(n) ? null : Math.min(hi, Math.max(lo, n));
+  };
+  const flag = (v) => v === true || v === 1 || v === '1';
+  const deviceView = (d) => ({ ...d.latest, id: d.id, age_ms: Date.now() - d.updated });
+
+  route('POST', '/api/device', (_m, body) => {
+    if (process.env.DEVICE_KEY && body.key !== process.env.DEVICE_KEY) throw new HttpError(403, 'Wrong device key');
+    const id = text(body.device, 'Device', 40, true).replace(/[^A-Za-z0-9_-]/g, '');
+    if (!id) throw new HttpError(400, 'Device must be letters, numbers, - or _');
+    const now = Date.now();
+    const hr = num(body.hr, 0, 250), spo2 = num(body.spo2, 0, 100);
+    const latest = {
+      motion_ok: flag(body.motion),
+      tilt: num(body.tilt, 0, 180),
+      ax: num(body.ax, -16, 16),
+      ay: num(body.ay, -16, 16),
+      az: num(body.az, -16, 16),
+      pulse_ok: flag(body.pulse),
+      finger: flag(body.finger),
+      hr: hr || null,
+      spo2: spo2 || null,
+      ir: num(body.ir, 0, 300000),
+      hr_max: num(body.hr_max, 0, 250) || null,
+      set_active: flag(body.set_active),
+      reps: num(body.reps, 0, 1000) || 0,
+      target: num(body.target, 0, 1000) || null,
+      quality: num(body.quality, 0, 100) || null,
+      exercise: text(body.exercise, 'Exercise', 60) || null,
+      rssi: num(body.rssi, -120, 0),
+      uptime_s: num(body.uptime, 0, 1e9),
+    };
+    let d = devices.get(id);
+    if (!d) {
+      if (devices.size >= 20) throw new HttpError(429, 'Too many devices');
+      d = { id, history: [] };
+      devices.set(id, d);
+    }
+    d.latest = latest;
+    d.updated = now;
+    d.history.push({ t: now, hr: latest.hr, spo2: latest.spo2, tilt: latest.tilt, reps: latest.reps });
+    if (d.history.length > DEVICE_HISTORY) d.history.splice(0, d.history.length - DEVICE_HISTORY);
+    return { ok: true };
+  });
+
+  route('GET', '/api/device', () => {
+    for (const [id, d] of devices) if (Date.now() - d.updated > 10 * 60 * 1000) devices.delete(id);
+    return { devices: [...devices.values()].sort((a, b) => b.updated - a.updated).map(deviceView) };
+  });
+
+  route('GET', '/api/device/([A-Za-z0-9_-]+)', (m) => {
+    const d = devices.get(m[1]);
+    if (!d) throw new HttpError(404, 'No readings from that device yet');
+    return { device: deviceView(d), history: d.history.map((h) => ({ ...h, ago_ms: Date.now() - h.t })) };
+  });
+
   route('POST', '/api/sim/start', () => {
     simStart();
     broadcast();

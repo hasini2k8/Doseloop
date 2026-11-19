@@ -13,12 +13,18 @@
 
 struct PulseDetector {
   static const int HIST = 6;
-  static constexpr float FINGER_IR = 50000;  // below this nothing is on the sensor
+  static constexpr float FINGER_IR = 50000;   // below this nothing is on the sensor
+  static constexpr float SATURATED = 250000;  // above this the sensor is flooded (bright light)
+  // A real pulse changes the light by roughly 0.3-2%. Sensor noise on an empty but bright
+  // sensor is far smaller, so peaks under 0.08% of the level are not heartbeats.
+  static constexpr float MIN_PULSE = 0.0008f;
+  static const uint32_t NO_PULSE_MS = 4000;    // light but no pulse for this long: no finger
 
   // Outputs.
   int bpm = 0;    // 0 until 3 consistent beats
   int spo2 = 0;   // 0 until 3 beats with a usable red/IR ratio
-  bool finger = false;
+  bool finger = false;   // something is on the sensor AND it has a pulse
+  bool contact = false;  // enough light comes back (a finger, or just a reflection)
   bool moving = false;  // the last second was disturbed by movement
 
   // Filter state.
@@ -29,6 +35,7 @@ struct PulseDetector {
   bool above = false;
   float peakVal = 0;
   uint32_t peakT = 0, lastPeakT = 0, quietFrom = 0;
+  uint32_t contactT = 0, pulseT = 0;  // when contact began; the last pulse-sized peak
   // Sums over the current beat, for SpO2 with any straight-line drift removed:
   // x = infrared pulse, y = red pulse, k = sample number within the beat.
   float sX = 0, sY = 0, sK = 0, sXX = 0, sXY = 0, sKK = 0, sXK = 0, sYK = 0;
@@ -58,15 +65,20 @@ struct PulseDetector {
 
   // One sample. Returns true when a heartbeat is accepted.
   bool update(uint32_t ir, uint32_t red, uint32_t t_ms) {
-    if (ir < FINGER_IR) {
-      if (finger) reset();
+    if (ir < FINGER_IR || ir > SATURATED) {
+      if (contact) reset();
       return false;
     }
-    if (!finger) {  // finger just arrived: start the filters at its level
-      finger = true;
+    if (!contact) {  // something just arrived: start the filters at its level
+      contact = true;
+      contactT = t_ms;
       dcIr = baseIr = ir;
       dcRed = baseRed = red;
     }
+    // A finger is only reported while pulses are being found (allowing a few seconds to find
+    // the first). Light reflected off the room or the sensor cover has no pulse.
+    finger = t_ms - contactT < NO_PULSE_MS || (pulseT && t_ms - pulseT < NO_PULSE_MS);
+    if (!finger) bpm = spo2 = 0;
     dcIr += 0.01f * (ir - dcIr);
     dcRed += 0.01f * (red - dcRed);
     baseIr += 0.04f * (ir - baseIr);
@@ -86,6 +98,7 @@ struct PulseDetector {
     if (ampMed > 0 && fabsf(lpIr) > 1.5f * ampMed) {
       quietFrom = t_ms + 600;
       moving = true;
+      pulseT = t_ms;  // a swing this big means a finger is there, just moving
       above = false;
       lastPeakT = 0;
       clearBeat();
@@ -132,6 +145,11 @@ struct PulseDetector {
       eRI = cXY - cXK * cYK / cKK;
     }
     clearBeat();
+    if (peakVal < MIN_PULSE * dcIr) {  // far too small to be a heartbeat: sensor noise,
+      lastPeakT = prev;                // so ignore it and keep timing from the last real beat
+      return false;
+    }
+    pulseT = peakT;
     // Remember the beat size (for movement detection) even before the rhythm is known.
     for (int k = 4; k > 0; k--) amp[k] = amp[k - 1];
     amp[0] = peakVal;

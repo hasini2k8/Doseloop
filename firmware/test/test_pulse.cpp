@@ -61,7 +61,17 @@ int main() {
         printf("%-18s true %3.0f bpm %3.0f%% -> measured %3d bpm %3d%%  %s\n", c.name, c.bpm, expectSpo2, r.bpm, r.spo2, ok ? "ok" : "FAIL");
     }
   }
-  // No finger: nothing reported.
+  // Empty sensor in a bright room: plenty of light comes back, but no pulse. After a few
+  // seconds it must say no finger and report nothing.
+  for (unsigned seed = 1; seed <= 5; seed++) {
+    srand(seed);
+    PulseDetector e;
+    for (int n = 0; n < 1500; n++) e.update((uint32_t)(70000 + 25 * gauss()), (uint32_t)(52000 + 25 * gauss()), 10 * n);
+    bool ok = !e.finger && !e.bpm && !e.spo2;
+    if (!ok) fails++;
+    if (seed == 1 || !ok) printf("bright, no finger  -> finger %d, %d bpm, %d%%  %s\n", e.finger, e.bpm, e.spo2, ok ? "ok" : "FAIL");
+  }
+  // No light at all.
   PulseDetector pd;
   for (int n = 0; n < 1000; n++) pd.update(3000, 2500, 10 * n);
   if (pd.bpm || pd.spo2 || pd.finger) fails++, printf("no finger: FAIL\n");

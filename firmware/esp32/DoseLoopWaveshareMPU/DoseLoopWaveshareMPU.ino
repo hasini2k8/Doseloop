@@ -19,6 +19,11 @@
  * "I2C_BUFFER_LENGTH redefined" warning on ESP32: harmless.)
  * Tools -> PSRAM: OPI PSRAM (the screen buffer uses it).
  *
+ * Wi-Fi (optional): fill in WIFI_SSID / WIFI_PASS below. The board then sends its readings
+ * about once a second to DOSELOOP_URL/api/device, shown on the website's "Wearable" page.
+ * 2.4 GHz networks only; university networks that need a username (eduroam) will not work,
+ * so use a phone hotspot or home Wi-Fi.
+ *
  * Serial (115200):  board -> app  HELLO,DOSELOOP,1 | SET,START | REP,<n>,<tempo_ms>,<rom_deg>,<quality>
  *                                 PART,<rom_deg> | HR,<bpm> | SPO2,<percent> | WARN,HR_HIGH
  *                                 SET,STOP,<reps>,<partials> | WARN,MPU6050_NOT_FOUND | WARN,MAX30102_NOT_FOUND
@@ -27,8 +32,19 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Arduino_GFX_Library.h>
 #include "MAX30105.h"
+
+// ---------------- settings ----------------
+const char *WIFI_SSID = "";  // your Wi-Fi name; leave empty to use USB only
+const char *WIFI_PASS = "";
+// The website the readings go to: the online one, or your computer running the app with
+// HOST=0.0.0.0 (for example "http://192.168.1.20:4198").
+const char *DOSELOOP_URL = "https://doseloop-tau.vercel.app";
+volatile int wifiLastCode = 0;  // last HTTP status (200 = the website got it); <0 = network error
 
 // Board pins (Waveshare ESP32-S3-LCD-1.69 schematic, V2 boards).
 #define LCD_DC 4
@@ -157,12 +173,18 @@ struct RepDetector {
 
 struct PulseDetector {
   static const int HIST = 6;
-  static constexpr float FINGER_IR = 50000;  // below this nothing is on the sensor
+  static constexpr float FINGER_IR = 50000;   // below this nothing is on the sensor
+  static constexpr float SATURATED = 250000;  // above this the sensor is flooded (bright light)
+  // A real pulse changes the light by roughly 0.3-2%. Sensor noise on an empty but bright
+  // sensor is far smaller, so peaks under 0.08% of the level are not heartbeats.
+  static constexpr float MIN_PULSE = 0.0008f;
+  static const uint32_t NO_PULSE_MS = 4000;    // light but no pulse for this long: no finger
 
   // Outputs.
   int bpm = 0;    // 0 until 3 consistent beats
   int spo2 = 0;   // 0 until 3 beats with a usable red/IR ratio
-  bool finger = false;
+  bool finger = false;   // something is on the sensor AND it has a pulse
+  bool contact = false;  // enough light comes back (a finger, or just a reflection)
   bool moving = false;  // the last second was disturbed by movement
 
   // Filter state.
@@ -173,6 +195,7 @@ struct PulseDetector {
   bool above = false;
   float peakVal = 0;
   uint32_t peakT = 0, lastPeakT = 0, quietFrom = 0;
+  uint32_t contactT = 0, pulseT = 0;  // when contact began; the last pulse-sized peak
   // Sums over the current beat, for SpO2 with any straight-line drift removed:
   // x = infrared pulse, y = red pulse, k = sample number within the beat.
   float sX = 0, sY = 0, sK = 0, sXX = 0, sXY = 0, sKK = 0, sXK = 0, sYK = 0;
@@ -202,15 +225,20 @@ struct PulseDetector {
 
   // One sample. Returns true when a heartbeat is accepted.
   bool update(uint32_t ir, uint32_t red, uint32_t t_ms) {
-    if (ir < FINGER_IR) {
-      if (finger) reset();
+    if (ir < FINGER_IR || ir > SATURATED) {
+      if (contact) reset();
       return false;
     }
-    if (!finger) {  // finger just arrived: start the filters at its level
-      finger = true;
+    if (!contact) {  // something just arrived: start the filters at its level
+      contact = true;
+      contactT = t_ms;
       dcIr = baseIr = ir;
       dcRed = baseRed = red;
     }
+    // A finger is only reported while pulses are being found (allowing a few seconds to find
+    // the first). Light reflected off the room or the sensor cover has no pulse.
+    finger = t_ms - contactT < NO_PULSE_MS || (pulseT && t_ms - pulseT < NO_PULSE_MS);
+    if (!finger) bpm = spo2 = 0;
     dcIr += 0.01f * (ir - dcIr);
     dcRed += 0.01f * (red - dcRed);
     baseIr += 0.04f * (ir - baseIr);
@@ -230,6 +258,7 @@ struct PulseDetector {
     if (ampMed > 0 && fabsf(lpIr) > 1.5f * ampMed) {
       quietFrom = t_ms + 600;
       moving = true;
+      pulseT = t_ms;  // a swing this big means a finger is there, just moving
       above = false;
       lastPeakT = 0;
       clearBeat();
@@ -276,6 +305,11 @@ struct PulseDetector {
       eRI = cXY - cXK * cYK / cKK;
     }
     clearBeat();
+    if (peakVal < MIN_PULSE * dcIr) {  // far too small to be a heartbeat: sensor noise,
+      lastPeakT = prev;                // so ignore it and keep timing from the last real beat
+      return false;
+    }
+    pulseT = peakT;
     // Remember the beat size (for movement detection) even before the rhythm is known.
     for (int k = 4; k > 0; k--) amp[k] = amp[k - 1];
     amp[0] = peakVal;
@@ -476,6 +510,10 @@ void drawScreen() {
   bool reached = targetReps && rd.count >= targetReps;
   gfx->fillScreen(BG);
   centered(exercise, 14, 2, INK);
+  if (strlen(WIFI_SSID)) {
+    bool up = WiFi.status() == WL_CONNECTED;
+    gfx->fillCircle(222, 12, 5, up && wifiLastCode == 200 ? GOOD : up ? ACCENT : TRACK);
+  }
 
   // Reps: the count, the dose and a progress bar.
   snprintf(buf, sizeof(buf), "%u", rd.count);
@@ -544,6 +582,74 @@ void drawScreen() {
   if (useCanvas) canvas->flush();
 }
 
+// ---------------- Wi-Fi ----------------
+// Runs on the other processor core, so a slow network never delays rep counting or the
+// pulse sensor. The main loop writes a fresh JSON reading into wifiBody once a second;
+// this task sends the newest one.
+portMUX_TYPE wifiMux = portMUX_INITIALIZER_UNLOCKED;
+char wifiBody[512];
+volatile bool wifiFresh = false;
+char deviceId[24];
+
+void wifiTask(void *) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t lastTry = millis();
+  String url = String(DOSELOOP_URL) + "/api/device";
+  bool https = url.startsWith("https");
+  WiFiClientSecure tls;
+  tls.setInsecure();  // demo: the server certificate is not checked
+  WiFiClient plain;
+  char body[512];
+  for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (millis() - lastTry > 10000) {  // keep trying every 10 s
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        lastTry = millis();
+      }
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+    bool go = false;
+    portENTER_CRITICAL(&wifiMux);
+    if (wifiFresh) {
+      memcpy(body, wifiBody, sizeof(body));
+      wifiFresh = false;
+      go = true;
+    }
+    portEXIT_CRITICAL(&wifiMux);
+    if (go) {
+      HTTPClient http;
+      http.setReuse(true);
+      http.setTimeout(3000);
+      if (https) http.begin(tls, url);
+      else http.begin(plain, url);
+      http.addHeader("Content-Type", "application/json");
+      wifiLastCode = http.POST((uint8_t *)body, strlen(body));
+      http.end();
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// Called once a second from loop(): the latest readings as JSON for the website.
+void queueReading(uint32_t now) {
+  if (!strlen(WIFI_SSID)) return;
+  char b[512];
+  snprintf(b, sizeof(b),
+           "{\"device\":\"%s\",\"motion\":%d,\"tilt\":%.1f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
+           "\"pulse\":%d,\"finger\":%d,\"hr\":%d,\"spo2\":%d,\"ir\":%lu,\"hr_max\":%d,"
+           "\"set_active\":%d,\"reps\":%u,\"target\":%d,\"quality\":%u,\"exercise\":\"%s\",\"rssi\":%d,\"uptime\":%lu}",
+           deviceId, mpuOk && liveFresh ? 1 : 0, liveTilt, liveAx, liveAy, liveAz,
+           oxOk ? 1 : 0, finger ? 1 : 0, hr, spo2, (unsigned long)lastIr, hrMax,
+           setActive ? 1 : 0, rd.count, targetReps, lastQuality, exercise, (int)WiFi.RSSI(), (unsigned long)(now / 1000));
+  portENTER_CRITICAL(&wifiMux);
+  memcpy(wifiBody, b, sizeof(b));
+  wifiFresh = true;
+  portEXIT_CRITICAL(&wifiMux);
+}
+
 void setup() {
   pinMode(PIN_SYS_EN, OUTPUT);
   digitalWrite(PIN_SYS_EN, HIGH);
@@ -571,6 +677,16 @@ void setup() {
   rd.reset(cfg);
   if (!mpuOk) send("WARN,MPU6050_NOT_FOUND");
   if (!oxOk) send("WARN,MAX30102_NOT_FOUND");
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(deviceId, sizeof(deviceId), "wearable-%02x%02x%02x", mac[3], mac[4], mac[5]);
+  if (strlen(WIFI_SSID)) {
+    xTaskCreatePinnedToCore(wifiTask, "wifi", 10240, nullptr, 1, nullptr, 0);
+    char b[80];
+    snprintf(b, sizeof(b), "WIFI,CONNECTING,%s", deviceId);
+    send(b);
+  }
   drawScreen();
 }
 
@@ -684,8 +800,10 @@ void loop() {
   static uint32_t nextStatus = 0;
   if ((int32_t)(now - nextStatus) >= 0) {
     nextStatus = now + 1000;
-    char st[160];
-    snprintf(st, sizeof(st), "DATA,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,reps=%u",
+    queueReading(now);
+    char st[200];
+    snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,reps=%u",
+             !strlen(WIFI_SSID) ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
              mpuOk ? "ok" : "missing", (int)(liveTilt + 0.5f), liveAx, liveAy, liveAz, oxOk ? "ok" : "missing",
              (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, rd.count);
     send(st);

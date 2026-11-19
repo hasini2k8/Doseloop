@@ -236,3 +236,31 @@ test('static app shell is served', async () => {
   assert.equal(res.status, 200);
   assert.match(await res.text(), /DoseLoop/);
 });
+
+// ---------- wearable over Wi-Fi ----------
+
+test('wearable readings posted over Wi-Fi are listed and kept as a short history', async () => {
+  const post = (b) => api('POST', '/api/device', { device: 'wearable-test', motion: 1, pulse: 1, ...b });
+  assert.equal((await post({ finger: 1, hr: 72, spo2: 97, tilt: 12.5, ax: 0.98, ay: 0.02, az: -0.1, reps: 0 })).status, 200);
+  assert.equal((await post({ finger: 1, hr: 75, spo2: 98, tilt: 80, reps: 1, set_active: 1, target: 10, quality: 88, exercise: 'Bicep curl' })).status, 200);
+  const list = (await api('GET', '/api/device')).body.devices;
+  const d = list.find((x) => x.id === 'wearable-test');
+  assert.ok(d && d.age_ms < 5000);
+  assert.equal(d.hr, 75);
+  assert.equal(d.reps, 1);
+  assert.equal(d.exercise, 'Bicep curl');
+  const detail = (await api('GET', '/api/device/wearable-test')).body;
+  assert.deepEqual(detail.history.map((h) => h.hr), [72, 75]);
+  // No finger: heart rate and oxygen are blank, not zero.
+  await post({ finger: 0, hr: 0, spo2: 0 });
+  const off = (await api('GET', '/api/device/wearable-test')).body.device;
+  assert.equal(off.finger, false);
+  assert.equal(off.hr, null);
+  assert.equal(off.spo2, null);
+});
+
+test('wearable endpoint rejects bad device names and unknown devices', async () => {
+  assert.equal((await api('POST', '/api/device', { hr: 70 })).status, 400);
+  assert.equal((await api('POST', '/api/device', { device: '!!!' })).status, 400);
+  assert.equal((await api('GET', '/api/device/nobody')).status, 404);
+});

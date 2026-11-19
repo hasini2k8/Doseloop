@@ -264,7 +264,7 @@ const DL = (() => {
 
   // ---------- router ----------
 
-  const NAV = [['#/', 'Roster', 'users'], ['#/live', 'Live class', 'activity'], ['#/feed', 'Community', 'chat'], ['#/intake', 'New intake', 'userplus']];
+  const NAV = [['#/', 'Roster', 'users'], ['#/live', 'Live class', 'activity'], ['#/device', 'Wearable', 'sensor'], ['#/feed', 'Community', 'chat'], ['#/intake', 'New intake', 'userplus']];
 
   async function renderNow() {
     if (cleanup) {
@@ -281,7 +281,7 @@ const DL = (() => {
     document.getElementById('nav').innerHTML = isHome ? '' : NAV.map(([h, t, i]) => `<a href="${h}" class="${h === here ? 'on' : ''}" ${h === here ? 'aria-current="page"' : ''}>${h === here ? '<span class="pill"></span>' : ''}${icon(i)}${t}</a>`).join('');
 
     drawTabbar(isHome, parts);
-    const name = isHome ? ({ session: 'session', track: 'track', community: 'homeCommunity' }[parts[2]] || (parts[1] ? 'homeDash' : 'homePick')) : { '': 'roster', p: 'detail', live: 'live', feed: 'feed', intake: 'intake' }[parts[0] || ''];
+    const name = isHome ? ({ session: 'session', track: 'track', community: 'homeCommunity' }[parts[2]] || (parts[1] ? 'homeDash' : 'homePick')) : { '': 'roster', p: 'detail', live: 'live', device: 'device', feed: 'feed', intake: 'intake' }[parts[0] || ''];
     const view = views[name];
     const token = (render.token = {});
     app.classList.remove('still');
