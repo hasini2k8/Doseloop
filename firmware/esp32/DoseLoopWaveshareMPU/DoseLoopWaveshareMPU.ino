@@ -376,6 +376,22 @@ struct PulseDetector {
         best = r[lag];
         bestLag = lag;
       }
+    // Half-rate check: a slow answer whose half-length also repeats strongly is really two
+    // beats (the strongest repeat skipped one). Use the half-length beat instead.
+    if (bestLag) {
+      int half = (bestLag + 1) / 2;
+      float rh = -1;
+      int hl = 0;
+      for (int lag = half - 2; lag <= half + 2; lag++)
+        if (lag >= lagMin && lag <= lagMax && r[lag] > rh) {
+          rh = r[lag];
+          hl = lag;
+        }
+      if (hl && hl > lagMin && hl < lagMax && r[hl] >= r[hl - 1] && r[hl] >= r[hl + 1] && rh > 0.75f * best) {
+        bestLag = hl;
+        best = rh;
+      }
+    }
     quality = best > 0 ? best : 0;
     moving = quality < 0.25f;
     if (quality < MIN_QUALITY || !bestLag) return false;
