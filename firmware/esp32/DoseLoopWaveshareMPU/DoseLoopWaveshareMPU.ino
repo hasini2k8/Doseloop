@@ -38,6 +38,10 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Arduino_GFX_Library.h>
+#include "FreeSans9pt7b.h"  // smooth fonts (files next to this sketch)
+#include "FreeSansBold9pt7b.h"
+#include "FreeSansBold12pt7b.h"
+#include "FreeSansBold24pt7b.h"
 #include "MAX30105.h"
 
 // ---------------- settings ----------------
@@ -628,69 +632,64 @@ void handleLine(const char *line) {
 }
 
 // ---------- screen (172 x 320, portrait) ----------
+// Smooth FreeSans fonts (from the Adafruit GFX library) for everything people read; the small
+// built-in font only for long hints. Text with these fonts is placed by its baseline.
 const int SW = 172, SH = 320;
 char deviceId[24] = "";
-const uint16_t BG = 0x0A06, INK = 0xFFFF, MUTED = 0xB5D6, ACCENT = 0xFD8F, GOOD = 0x5EB5, ALERT = 0xF9C7, TRACK = 0x2A49;
+constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
+const uint16_t BG = rgb(11, 18, 32);       // deep navy
+const uint16_t CARD = rgb(24, 33, 52);     // raised card
+const uint16_t TRACK = rgb(44, 56, 80);    // empty part of rings and bars
+const uint16_t INK = rgb(244, 246, 250);   // main text
+const uint16_t MUTED = rgb(138, 151, 173); // labels
+const uint16_t ACCENT = rgb(46, 196, 160); // teal: progress, buttons
+const uint16_t GOOD = rgb(74, 222, 128);   // green: done
+const uint16_t WARN = rgb(255, 179, 71);   // amber
+const uint16_t ALERT = rgb(255, 77, 109);  // red: heart, warnings
 
-void centered(const char *s, int y, int size, uint16_t color) {
+const GFXfont *F_SMALL = &FreeSans9pt7b;
+const GFXfont *F_SMALLB = &FreeSansBold9pt7b;
+const GFXfont *F_MED = &FreeSansBold12pt7b;
+const GFXfont *F_BIG = &FreeSansBold24pt7b;
+
+// Width of text in a font (and size), for centring and right-aligning.
+int textW(const char *s, const GFXfont *f, int size, int16_t *xoff = nullptr) {
   int16_t x1, y1;
   uint16_t w, h;
+  gfx->setFont(f);
   gfx->setTextSize(size);
   gfx->getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  if (xoff) *xoff = x1;
+  return w;
+}
+
+// Text centred on cx with its baseline at y (f = nullptr: the small built-in font, y = top).
+void textC(const char *s, int cx, int y, const GFXfont *f, int size, uint16_t color) {
+  int16_t x1;
+  int w = textW(s, f, size, &x1);
   gfx->setTextColor(color);
-  gfx->setCursor(w < SW ? (SW - w) / 2 : 0, y);
+  gfx->setCursor(cx - w / 2 - x1, y);
   gfx->print(s);
-}
-
-// Large text if it fits across the screen, otherwise small.
-void centeredFit(const char *s, int y, uint16_t color) {
-  centered(s, y, strlen(s) * 12 <= SW - 8 ? 2 : 1, color);
-}
-
-// One accelerometer axis as a row: label, value in g, and a bar from the centre (-1..+1 g).
-void axisRow(const char *label, float v, int y) {
-  char buf[12];
+  gfx->setFont((const GFXfont *)nullptr);
   gfx->setTextSize(1);
-  gfx->setTextColor(MUTED);
-  gfx->setCursor(10, y);
-  gfx->print(label);
-  snprintf(buf, sizeof(buf), "%+.2f", v);
-  gfx->setTextColor(INK);
-  gfx->setCursor(22, y);
-  gfx->print(buf);
-  int len = (int)(constrain(v, -1.0f, 1.0f) * 50);
-  gfx->fillRect(60, y + 2, 102, 4, TRACK);
-  if (len > 0) gfx->fillRect(111, y + 2, len, 4, ACCENT);
-  else if (len < 0) gfx->fillRect(111 + len, y + 2, -len, 4, ACCENT);
 }
+void textL(const char *s, int x, int y, const GFXfont *f, uint16_t color) {
+  gfx->setFont(f);
+  gfx->setTextSize(1);
+  gfx->setTextColor(color);
+  gfx->setCursor(x, y);
+  gfx->print(s);
+  gfx->setFont((const GFXfont *)nullptr);
+}
+void textR(const char *s, int xr, int y, const GFXfont *f, uint16_t color) {
+  int16_t x1;
+  int w = textW(s, f, 1, &x1);
+  textL(s, xr - w - x1, y, f, color);
+}
+// Older helper still used for one-line hints: small built-in font, centred, y = top.
+void centered(const char *s, int y, int size, uint16_t color) { textC(s, SW / 2, y, nullptr, size, color); }
 
-// Wi-Fi state in words at the very top; on the exercise screen the time comes first.
-void wifiLine(bool withTime) {
-  char w[40], t[8] = "";
-  uint16_t c;
-  struct tm now;
-  if (withTime && getLocalTime(&now, 0)) strftime(t, sizeof(t), "%H:%M ", &now);
-  if (!strlen(WIFI_SSID)) {
-    snprintf(w, sizeof(w), "%sWi-Fi not set up", t);
-    c = MUTED;
-  } else if (!wifiWanted) {
-    snprintf(w, sizeof(w), "%sWi-Fi off", t);
-    c = MUTED;
-  } else if (WiFi.status() != WL_CONNECTED) {
-    snprintf(w, sizeof(w), "%sWi-Fi: connecting...", t);
-    c = ACCENT;
-  } else if (wifiLastCode == 200) {
-    snprintf(w, sizeof(w), "%sWi-Fi: online", t);
-    c = GOOD;
-  } else if (wifiLastCode == 0) {
-    snprintf(w, sizeof(w), "%sWi-Fi: sending...", t);
-    c = ACCENT;
-  } else {
-    snprintf(w, sizeof(w), "%sWi-Fi error %d", t, wifiLastCode);
-    c = ALERT;
-  }
-  centered(w, 6, 1, c);
-}
+void card(int x, int y, int w, int h) { gfx->fillRoundRect(x, y, w, h, 14, CARD); }
 
 // A heart shape centred on (cx, cy), about 2*s wide.
 void drawHeart(int cx, int cy, int s, uint16_t c) {
@@ -699,125 +698,158 @@ void drawHeart(int cx, int cy, int s, uint16_t c) {
   gfx->fillTriangle(cx - s - 1, cy - s / 8, cx + s + 1, cy - s / 8, cx, cy + s, c);
 }
 
-// The on-screen Wi-Fi button on the watch face (tap to go online or offline).
-const int BTN_X = 12, BTN_Y = 250, BTN_W = 148, BTN_H = 38;
+// Ring from 12 o'clock, clockwise, frac 0..1.
+void ring(int cx, int cy, int ro, int ri, float frac, uint16_t c) {
+  gfx->fillArc(cx, cy, ro, ri, 0, 360, TRACK);
+  if (frac <= 0) return;
+  float end = 270 + 360 * (frac > 1 ? 1 : frac);
+  if (end <= 360) gfx->fillArc(cx, cy, ro, ri, 270, end, c);
+  else {
+    gfx->fillArc(cx, cy, ro, ri, 270, 360, c);
+    gfx->fillArc(cx, cy, ro, ri, 0, end - 360, c);
+  }
+}
 
-// Watch face, shown whenever no set is running: the time, a heart that beats at the
-// measured rate, the heart rate large, blood oxygen, and the Wi-Fi button.
+// Status row at the top: a coloured dot and a word; on the exercise screen, the time first.
+void wifiLine(bool withTime) {
+  char w[40], t[8] = "";
+  uint16_t c;
+  struct tm now;
+  if (withTime && getLocalTime(&now, 0)) strftime(t, sizeof(t), "%H:%M  ", &now);
+  const char *state;
+  if (!strlen(WIFI_SSID)) state = "Wi-Fi not set up", c = MUTED;
+  else if (!wifiWanted) state = "Offline", c = MUTED;
+  else if (WiFi.status() != WL_CONNECTED) state = "Connecting", c = WARN;
+  else if (wifiLastCode == 200) state = "Online", c = ACCENT;
+  else if (wifiLastCode == 0) state = "Sending", c = WARN;
+  else state = "Site error", c = ALERT;
+  snprintf(w, sizeof(w), "%s%s", t, state);
+  int16_t x1;
+  int tw = textW(w, F_SMALL, 1, &x1);
+  int x = (SW - tw - 12) / 2;
+  gfx->fillCircle(x + 3, 12, 3, c);
+  textL(w, x + 12 - x1, 17, F_SMALL, withTime ? INK : MUTED);
+}
+
+// The on-screen Wi-Fi button on the watch face (tap to go online or offline).
+const int BTN_X = 10, BTN_Y = 278, BTN_W = 152, BTN_H = 34;
+
+// Watch face, shown whenever no set is running.
 void drawWatch() {
   char buf[40];
   bool hrHigh = hrMax && hr > hrMax;
   gfx->fillScreen(BG);
   wifiLine(false);
 
+  // Time and date.
   struct tm now;
-  if (getLocalTime(&now, 0)) {  // set from the internet once online; keeps running offline
+  if (getLocalTime(&now, 0)) {
     strftime(buf, sizeof(buf), "%H:%M", &now);
-    centered(buf, 22, 4, INK);
+    textC(buf, SW / 2, 66, F_BIG, 1, INK);
     strftime(buf, sizeof(buf), "%a %d %b", &now);
-    centered(buf, 58, 2, MUTED);
+    textC(buf, SW / 2, 88, F_SMALL, 1, MUTED);
   } else {
-    centered("--:--", 22, 4, TRACK);
-    centered(strlen(WIFI_SSID) ? "Go online to set the time" : "No Wi-Fi set up", 60, 1, MUTED);
+    textC("--:--", SW / 2, 66, F_BIG, 1, TRACK);
+    centered(strlen(WIFI_SSID) ? "Go online to set the time" : "No Wi-Fi set up", 78, 1, MUTED);
   }
 
-  // Heart: grows briefly at each beat, at the measured rate.
+  // Heart-rate card: label, beating heart, the number large.
+  card(4, 102, 164, 124);
   bool big = hr && (millis() % (60000UL / hr)) < 180;
-  drawHeart(SW / 2, 98, big ? 17 : 13, hr ? ALERT : TRACK);
+  drawHeart(26, 121, big ? 8 : 6, hr ? ALERT : TRACK);
+  textL("Heart rate", 40, 127, F_SMALL, MUTED);
+  if (hr) {
+    snprintf(buf, sizeof(buf), "%d", hr);
+    textC(buf, SW / 2, 196, F_BIG, 2, hrHigh ? ALERT : INK);
+    textC(hrHigh ? "bpm  -  rest now" : "bpm", SW / 2, 216, F_SMALL, 1, hrHigh ? ALERT : MUTED);
+  } else {
+    textC("--", SW / 2, 186, F_BIG, 1, TRACK);
+    const char *hint = !oxOk ? "Pulse sensor not found"
+                     : !finger ? "Rest a finger on the sensor"
+                     : pulse.moving ? "Hold your finger still"
+                     : "Reading your pulse...";
+    centered(hint, 204, 1, !oxOk ? ALERT : finger ? WARN : MUTED);
+  }
 
-  snprintf(buf, sizeof(buf), hr ? "%d" : "--", hr);
-  centered(buf, 124, 6, hrHigh ? ALERT : INK);
-  centered("BPM", 170, 2, hrHigh ? ALERT : MUTED);
+  // Oxygen card.
+  card(8, 232, 156, 38);
+  textL("Oxygen", 18, 256, F_SMALL, MUTED);
+  snprintf(buf, sizeof(buf), spo2 ? "%d%%" : "--", spo2);
+  textR(buf, 154, 258, F_MED, spo2 ? (spo2 < 90 ? ALERT : INK) : TRACK);
 
-  snprintf(buf, sizeof(buf), spo2 ? "O2 %d%%" : "O2 --", spo2);
-  centered(buf, 194, 2, spo2 && spo2 < 90 ? ALERT : INK);
-
-  const char *hint = !oxOk ? "Pulse sensor not found"
-                   : hrHigh ? "Heart rate high: rest"
-                   : !finger ? "Rest a finger on the sensor"
-                   : !hr && pulse.moving ? "Hold your finger still"
-                   : !hr ? "Reading your pulse..."
-                   : "BOOT: start exercise";
-  centered(hint, 222, 1, hrHigh || !oxOk ? ALERT : !hr ? ACCENT : MUTED);
-
-  // Wi-Fi button.
+  // Wi-Fi button (a pill).
   if (strlen(WIFI_SSID)) {
     bool online = wifiWanted && WiFi.status() == WL_CONNECTED;
-    uint16_t fill = !wifiWanted ? ACCENT : online ? GOOD : TRACK;
-    gfx->fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 12, fill);
-    const char *label = !wifiWanted ? "Go online" : online ? "Online" : "Connecting";
-    centered(label, BTN_Y + 11, 2, !wifiWanted || online ? BG : INK);
-    centered(!wifiWanted ? "tap to connect to Wi-Fi" : "tap to disconnect", BTN_Y + BTN_H + 6, 1, MUTED);
+    uint16_t fill = !wifiWanted ? ACCENT : online ? CARD : TRACK;
+    gfx->fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, BTN_H / 2, fill);
+    if (online) gfx->drawRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, BTN_H / 2, ACCENT);
+    const char *label = !wifiWanted ? "Go online" : online ? "Online" : "Connecting...";
+    textC(label, SW / 2, BTN_Y + 22, F_SMALLB, 1, !wifiWanted ? BG : online ? ACCENT : INK);
+  } else {
+    textC("BOOT: start exercise", SW / 2, 300, F_SMALL, 1, MUTED);
   }
   if (useCanvas) canvas->flush();
 }
 
-// Exercise screen, during a set.
+// Exercise screen, during a set: progress ring with the rep count, heart rate and oxygen,
+// how far the arm has moved, and the last rep's form.
 void drawWorkout() {
-  char buf[40];
+  char buf[48];
   bool reached = targetReps && rd.count >= targetReps;
   bool hrHigh = hrMax && hr > hrMax;
   gfx->fillScreen(BG);
   wifiLine(true);
-  centeredFit(exercise, 22, INK);
 
-  // Reps: the count, the dose and a progress bar.
+  // Exercise name: bold, smaller if long.
+  if (textW(exercise, F_MED, 1) <= SW - 12) textC(exercise, SW / 2, 44, F_MED, 1, INK);
+  else if (textW(exercise, F_SMALLB, 1) <= SW - 12) textC(exercise, SW / 2, 42, F_SMALLB, 1, INK);
+  else if (textW(exercise, F_SMALL, 1) <= SW - 12) textC(exercise, SW / 2, 42, F_SMALL, 1, INK);
+  else centered(exercise, 32, 1, INK);
+
+  // Progress ring with the count inside.
+  float frac = targetReps ? (float)rd.count / targetReps : 0;
+  ring(SW / 2, 118, 58, 49, frac, reached ? GOOD : ACCENT);
   snprintf(buf, sizeof(buf), "%u", rd.count);
-  centered(buf, 42, 8, reached ? GOOD : INK);
-  snprintf(buf, sizeof(buf), "of %d reps", targetReps);
-  centered(buf, 104, 2, MUTED);
-  int fill = targetReps ? min(152, (int)(152L * rd.count / targetReps)) : 0;
-  gfx->fillRoundRect(10, 126, 152, 8, 4, TRACK);
-  if (fill) gfx->fillRoundRect(10, 126, fill, 8, 4, reached ? GOOD : ACCENT);
+  textC(buf, SW / 2, 130, F_BIG, 1, reached ? GOOD : INK);
+  snprintf(buf, sizeof(buf), reached ? "done!" : "of %d", targetReps);
+  textC(buf, SW / 2, 152, F_SMALL, 1, reached ? GOOD : MUTED);
 
-  // Heart rate and oxygen.
-  if (!oxOk) {
-    centered("Pulse sensor not found", 152, 1, ALERT);
-  } else if (!finger) {
-    centered("Rest a finger on the sensor", 152, 1, MUTED);
-  } else if (!hr && pulse.moving) {
-    centered("Hold your finger still", 152, 1, ACCENT);
-  } else if (!hr) {
-    centered("Reading pulse...", 152, 1, MUTED);
-  } else {
-    snprintf(buf, sizeof(buf), "%d bpm", hr);
-    drawHeart(22, 152, 8, ALERT);
-    centered(buf, 146, 2, hrHigh ? ALERT : INK);
-    snprintf(buf, sizeof(buf), spo2 ? "O2 %d%%" : "O2 --", spo2);
-    centered(buf, 166, 2, spo2 && spo2 < 90 ? ALERT : INK);
-  }
+  // Heart rate and oxygen side by side.
+  card(8, 186, 76, 48);
+  card(88, 186, 76, 48);
+  drawHeart(20, 200, 5, hr ? ALERT : TRACK);
+  textL("bpm", 30, 205, F_SMALL, MUTED);
+  snprintf(buf, sizeof(buf), hr ? "%d" : "--", hr);
+  textL(buf, 16, 228, F_MED, hr ? (hrHigh ? ALERT : INK) : TRACK);
+  textL("SpO2", 98, 205, F_SMALL, MUTED);
+  snprintf(buf, sizeof(buf), spo2 ? "%d%%" : "--", spo2);
+  textL(buf, 96, 228, F_MED, spo2 ? (spo2 < 90 ? ALERT : INK) : TRACK);
 
+  // How far the arm has moved this rep, against the prescribed range (tick = half range,
+  // which a full rep must pass).
   if (!mpuOk || !liveFresh) {
-    centered("No motion data", 196, 2, ALERT);
-    centered("SDA GPIO11  SCL GPIO10", 218, 1, MUTED);
+    centered("Motion sensor not found", 246, 1, ALERT);
   } else {
-    // How far the arm is from where it started, against the prescribed range (the green
-    // tick is half the range: a full rep must pass it).
     float move = rd.cal_n >= CAL_SAMPLES ? fabsf(rd.angle_f - rd.rest_deg) : 0;
-    snprintf(buf, sizeof(buf), "Moved %d deg", (int)(move + 0.5f));
-    centered(buf, 194, 2, INK);
     float full = cfg.target_rom_deg;
+    textL("Range", 10, 254, F_SMALL, MUTED);
+    snprintf(buf, sizeof(buf), "%d deg", (int)(move + 0.5f));
+    textR(buf, 162, 254, F_SMALL, INK);
     int w = (int)(152 * constrain(move / full, 0.0f, 1.0f));
-    gfx->fillRoundRect(10, 214, 152, 10, 5, TRACK);
-    if (w) gfx->fillRoundRect(10, 214, max(w, 10), 10, 5, move >= VALID_FRAC * full ? GOOD : ACCENT);
-    gfx->fillRect(10 + (int)(152 * VALID_FRAC), 211, 2, 16, GOOD);
-
-    // Raw accelerometer, in g.
-    axisRow("X", liveAx, 236);
-    axisRow("Y", liveAy, 248);
-    axisRow("Z", liveAz, 260);
+    gfx->fillRoundRect(10, 262, 152, 8, 4, TRACK);
+    if (w) gfx->fillRoundRect(10, 262, max(w, 8), 8, 4, move >= VALID_FRAC * full ? GOOD : ACCENT);
+    gfx->fillRect(10 + (int)(152 * VALID_FRAC), 259, 2, 14, INK);
   }
 
-  // Last rep: range, time and form score.
-  if (lastQuality) {
-    snprintf(buf, sizeof(buf), "%udeg %.1fs Form %u%%", lastRom, lastTempo / 1000.0f, lastQuality);
-    centered(buf, 278, 1, lastQuality >= 70 ? GOOD : ACCENT);
+  // Last rep, or what to do.
+  if (hrHigh) centered("Heart rate high: rest", 284, 1, ALERT);
+  else if (lastQuality) {
+    snprintf(buf, sizeof(buf), "Last rep: form %u  |  %.1fs", lastQuality, lastTempo / 1000.0f);
+    centered(buf, 284, 1, lastQuality >= 70 ? GOOD : WARN);
   }
-  const char *hint = hrHigh ? "Heart rate high: rest" : !mpuOk ? "Sensor not found" : reached ? "Dose reached" : "BOOT: stop the set";
-  centeredFit(hint, 296, hrHigh || !mpuOk ? ALERT : reached ? GOOD : ACCENT);
+  centered(reached ? "Press BOOT to finish" : "Press BOOT to stop", 302, 1, MUTED);
   if (useCanvas) canvas->flush();
 }
-
 
 // ---------------- touch screen (AXS5106L) ----------------
 // Its own I2C connection, separate from the sensors. A touch is read by asking register 0x01
