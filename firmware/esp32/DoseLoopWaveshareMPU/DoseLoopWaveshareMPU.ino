@@ -471,10 +471,14 @@ uint32_t oxLastSample = 0;          // when the pulse sensor last delivered a re
 uint16_t oxRestarts = 0;
 bool rawStream = false;  // RAW,1 over USB: print every pulse-sensor reading (for checking the signal)
 
+bool oxReg(uint8_t reg, uint8_t &val);
+
 void oxSetup() {
   oxLastSample = millis();
   if (!(oxOk = ox.begin(Wire, I2C_SPEED_STANDARD))) return;
   ox.setup(36 /* LED level: about 7 mA. Brighter put fingertips near the sensor's maximum, flattening the pulse */, 4 /* averaging */, 2 /* red + IR */, 400 /* samples/s */, 411 /* pulse width */, 4096 /* range */);
+  uint8_t clear;
+  oxReg(0x00, clear);  // clear the power-up flag, so a later one means a real power dip
 }
 
 // Reads the sensor's own 32-reading buffer directly. (The SparkFun library keeps only 4
@@ -526,7 +530,10 @@ void oxPoll() {
     hr = spo2 = 0;
     lastIr = lastRed = 0;
     oxRestarts++;
-    send("WARN,MAX30102_RESTART");
+    uint8_t st;
+    if (!oxReg(0x00, st)) send("WARN,MAX30102_RESTART,reason=no_answer");  // wire or connection
+    else if (st & 0x01) send("WARN,MAX30102_RESTART,reason=power_dip");  // the sensor lost power and reset
+    else send("WARN,MAX30102_RESTART,reason=stalled");
     oxSetup();  // if the sensor does not answer, oxOk goes false and loop() retries every 3 s
     return;
   }
@@ -578,6 +585,10 @@ void setStop() {
 
 void handleLine(const char *line) {
   unsigned rom, tempo, reps, hrLimit;
+  if (strncmp(line, "BL,", 3) == 0) {  // backlight brightness 0-255 (for testing)
+    analogWrite(LCD_BL, constrain(atoi(line + 3), 0, 255));
+    return;
+  }
   if (strcmp(line, "RAW,1") == 0 || strcmp(line, "RAW,0") == 0) {  // raw pulse readings on/off
     rawStream = line[4] == '1';
     return;
