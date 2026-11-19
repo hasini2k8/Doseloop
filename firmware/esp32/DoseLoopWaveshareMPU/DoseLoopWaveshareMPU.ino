@@ -509,11 +509,29 @@ void drawScreen() {
   char buf[40];
   bool reached = targetReps && rd.count >= targetReps;
   gfx->fillScreen(BG);
-  centered(exercise, 14, 2, INK);
-  if (strlen(WIFI_SSID)) {
-    bool up = WiFi.status() == WL_CONNECTED;
-    gfx->fillCircle(222, 12, 5, up && wifiLastCode == 200 ? GOOD : up ? ACCENT : TRACK);
+  // Wi-Fi state in words at the very top: is the website getting the readings?
+  {
+    char w[48];
+    uint16_t c;
+    if (!strlen(WIFI_SSID)) {
+      snprintf(w, sizeof(w), "Wi-Fi off (USB only)");
+      c = MUTED;
+    } else if (WiFi.status() != WL_CONNECTED) {
+      snprintf(w, sizeof(w), "Wi-Fi: connecting to %.20s...", WIFI_SSID);
+      c = ACCENT;
+    } else if (wifiLastCode == 200) {
+      snprintf(w, sizeof(w), "Wi-Fi: connected, website OK");
+      c = GOOD;
+    } else if (wifiLastCode == 0) {
+      snprintf(w, sizeof(w), "Wi-Fi: connected, sending...");
+      c = ACCENT;
+    } else {
+      snprintf(w, sizeof(w), "Wi-Fi: connected, website error %d", wifiLastCode);
+      c = ALERT;
+    }
+    centered(w, 4, 1, c);
   }
+  centered(exercise, 18, 2, INK);
 
   // Reps: the count, the dose and a progress bar.
   snprintf(buf, sizeof(buf), "%u", rd.count);
