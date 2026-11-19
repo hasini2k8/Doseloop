@@ -33,6 +33,7 @@
 #include <Wire.h>
 #include <math.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <time.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -45,7 +46,9 @@ const char *WIFI_PASS = "";
 // The website the readings go to: the online one, or your computer running the app with
 // HOST=0.0.0.0 (for example "http://192.168.1.20:4198").
 const char *DOSELOOP_URL = "https://doseloop-tau.vercel.app";
-volatile int wifiLastCode = 0;  // last HTTP status (200 = the website got it); <0 = network error
+volatile int wifiLastCode = 0;
+volatile bool wifiWanted = true;  // the on-screen button turns Wi-Fi on and off (remembered)
+Preferences prefs;  // last HTTP status (200 = the website got it); <0 = network error
 
 // Board pins: Waveshare ESP32-S3-Touch-LCD-1.47 (Waveshare's Arduino example for the board).
 #define LCD_DC 45
@@ -645,24 +648,29 @@ void axisRow(const char *label, float v, int y) {
   else if (len < 0) gfx->fillRect(111 + len, y + 2, -len, 4, ACCENT);
 }
 
-// Wi-Fi state in words at the very top of both screens.
-void wifiLine() {
-  char w[32];
+// Wi-Fi state in words at the very top; on the exercise screen the time comes first.
+void wifiLine(bool withTime) {
+  char w[40], t[8] = "";
   uint16_t c;
+  struct tm now;
+  if (withTime && getLocalTime(&now, 0)) strftime(t, sizeof(t), "%H:%M ", &now);
   if (!strlen(WIFI_SSID)) {
-    snprintf(w, sizeof(w), "Wi-Fi off");
+    snprintf(w, sizeof(w), "%sWi-Fi not set up", t);
+    c = MUTED;
+  } else if (!wifiWanted) {
+    snprintf(w, sizeof(w), "%sWi-Fi off", t);
     c = MUTED;
   } else if (WiFi.status() != WL_CONNECTED) {
-    snprintf(w, sizeof(w), "Wi-Fi: connecting...");
+    snprintf(w, sizeof(w), "%sWi-Fi: connecting...", t);
     c = ACCENT;
   } else if (wifiLastCode == 200) {
-    snprintf(w, sizeof(w), "Wi-Fi: online");
+    snprintf(w, sizeof(w), "%sWi-Fi: online", t);
     c = GOOD;
   } else if (wifiLastCode == 0) {
-    snprintf(w, sizeof(w), "Wi-Fi: sending...");
+    snprintf(w, sizeof(w), "%sWi-Fi: sending...", t);
     c = ACCENT;
   } else {
-    snprintf(w, sizeof(w), "Wi-Fi: website error %d", wifiLastCode);
+    snprintf(w, sizeof(w), "%sWi-Fi error %d", t, wifiLastCode);
     c = ALERT;
   }
   centered(w, 6, 1, c);
@@ -675,35 +683,38 @@ void drawHeart(int cx, int cy, int s, uint16_t c) {
   gfx->fillTriangle(cx - s - 1, cy - s / 8, cx + s + 1, cy - s / 8, cx, cy + s, c);
 }
 
+// The on-screen Wi-Fi button on the watch face (tap to go online or offline).
+const int BTN_X = 12, BTN_Y = 250, BTN_W = 148, BTN_H = 38;
+
 // Watch face, shown whenever no set is running: the time, a heart that beats at the
-// measured rate, the heart rate large, and blood oxygen.
+// measured rate, the heart rate large, blood oxygen, and the Wi-Fi button.
 void drawWatch() {
   char buf[40];
   bool hrHigh = hrMax && hr > hrMax;
   gfx->fillScreen(BG);
-  wifiLine();
+  wifiLine(false);
 
   struct tm now;
-  if (strlen(WIFI_SSID) && getLocalTime(&now, 0)) {  // time from the internet, once on Wi-Fi
+  if (getLocalTime(&now, 0)) {  // set from the internet once online; keeps running offline
     strftime(buf, sizeof(buf), "%H:%M", &now);
-    centered(buf, 26, 4, INK);
+    centered(buf, 22, 4, INK);
     strftime(buf, sizeof(buf), "%a %d %b", &now);
-    centered(buf, 64, 2, MUTED);
+    centered(buf, 58, 2, MUTED);
   } else {
-    centered("DoseLoop", 30, 2, INK);
-    centered(strlen(WIFI_SSID) ? "getting the time..." : "wearable", 54, 1, MUTED);
+    centered("--:--", 22, 4, TRACK);
+    centered(strlen(WIFI_SSID) ? "Go online to set the time" : "No Wi-Fi set up", 60, 1, MUTED);
   }
 
   // Heart: grows briefly at each beat, at the measured rate.
   bool big = hr && (millis() % (60000UL / hr)) < 180;
-  drawHeart(SW / 2, 112, big ? 20 : 16, hr ? ALERT : TRACK);
+  drawHeart(SW / 2, 98, big ? 17 : 13, hr ? ALERT : TRACK);
 
   snprintf(buf, sizeof(buf), hr ? "%d" : "--", hr);
-  centered(buf, 146, 7, hrHigh ? ALERT : INK);
-  centered("BPM", 202, 2, hrHigh ? ALERT : MUTED);
+  centered(buf, 124, 6, hrHigh ? ALERT : INK);
+  centered("BPM", 170, 2, hrHigh ? ALERT : MUTED);
 
   snprintf(buf, sizeof(buf), spo2 ? "O2 %d%%" : "O2 --", spo2);
-  centered(buf, 232, 3, spo2 && spo2 < 90 ? ALERT : INK);
+  centered(buf, 194, 2, spo2 && spo2 < 90 ? ALERT : INK);
 
   const char *hint = !oxOk ? "Pulse sensor not found"
                    : hrHigh ? "Heart rate high: rest"
@@ -711,8 +722,17 @@ void drawWatch() {
                    : !hr && pulse.moving ? "Hold your finger still"
                    : !hr ? "Reading your pulse..."
                    : "BOOT: start exercise";
-  centered(hint, 276, 1, hrHigh || !oxOk ? ALERT : !hr ? ACCENT : MUTED);
-  centered(deviceId, 300, 1, TRACK);
+  centered(hint, 222, 1, hrHigh || !oxOk ? ALERT : !hr ? ACCENT : MUTED);
+
+  // Wi-Fi button.
+  if (strlen(WIFI_SSID)) {
+    bool online = wifiWanted && WiFi.status() == WL_CONNECTED;
+    uint16_t fill = !wifiWanted ? ACCENT : online ? GOOD : TRACK;
+    gfx->fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 12, fill);
+    const char *label = !wifiWanted ? "Go online" : online ? "Online" : "Connecting";
+    centered(label, BTN_Y + 11, 2, !wifiWanted || online ? BG : INK);
+    centered(!wifiWanted ? "tap to connect to Wi-Fi" : "tap to disconnect", BTN_Y + BTN_H + 6, 1, MUTED);
+  }
   if (useCanvas) canvas->flush();
 }
 
@@ -722,7 +742,7 @@ void drawWorkout() {
   bool reached = targetReps && rd.count >= targetReps;
   bool hrHigh = hrMax && hr > hrMax;
   gfx->fillScreen(BG);
-  wifiLine();
+  wifiLine(true);
   centeredFit(exercise, 22, INK);
 
   // Reps: the count, the dose and a progress bar.
@@ -782,6 +802,57 @@ void drawWorkout() {
   if (useCanvas) canvas->flush();
 }
 
+
+// ---------------- touch screen (AXS5106L) ----------------
+// Its own I2C connection, separate from the sensors. A touch is read by asking register 0x01
+// for the number of fingers and the first finger's position.
+#define TP_SDA 42
+#define TP_SCL 41
+#define TP_RST 47
+#define TP_INT 48
+#define TP_ADDR 0x63
+bool touchOk = false;
+
+void touchInit() {
+  Wire1.begin(TP_SDA, TP_SCL, 400000);
+  pinMode(TP_RST, OUTPUT);
+  digitalWrite(TP_RST, LOW);
+  delay(200);
+  digitalWrite(TP_RST, HIGH);
+  delay(300);
+  pinMode(TP_INT, INPUT_PULLUP);
+  Wire1.beginTransmission(TP_ADDR);
+  touchOk = Wire1.endTransmission() == 0;
+}
+
+// True while a finger is on the screen; x, y in screen pixels.
+bool touchRead(int &x, int &y) {
+  if (!touchOk) return false;
+  uint8_t d[14];
+  Wire1.beginTransmission(TP_ADDR);
+  Wire1.write(0x01);
+  if (Wire1.endTransmission() != 0) return false;
+  if (Wire1.requestFrom(TP_ADDR, 14) != 14) return false;
+  for (int i = 0; i < 14; i++) d[i] = Wire1.read();
+  if (d[1] == 0 || d[1] > 5) return false;
+  x = SW - 1 - (((d[2] & 0x0F) << 8) | d[3]);
+  y = ((d[4] & 0x0F) << 8) | d[5];
+  return true;
+}
+
+// A tap (finger down) on the watch face's Wi-Fi button turns Wi-Fi on or off, remembered.
+void handleTap(int x, int y) {
+  char b[48];
+  snprintf(b, sizeof(b), "TOUCH,%d,%d", x, y);
+  send(b);
+  if (setActive || !strlen(WIFI_SSID)) return;
+  if (y >= BTN_Y - 10 && y <= BTN_Y + BTN_H + 16) {
+    wifiWanted = !wifiWanted;
+    prefs.putBool("wifi", wifiWanted);
+    send(wifiWanted ? "WIFI,ON" : "WIFI,OFF");
+  }
+}
+
 // The screen: the watch face between sets, the exercise screen during a set.
 void drawScreen() {
   if (setActive) drawWorkout();
@@ -797,9 +868,8 @@ char wifiBody[512];
 volatile bool wifiFresh = false;
 
 void wifiTask(void *) {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t lastTry = millis();
+  bool started = false;
+  uint32_t lastTry = 0;
   String url = String(DOSELOOP_URL) + "/api/device";
   bool https = url.startsWith("https");
   WiFiClientSecure tls;
@@ -807,6 +877,21 @@ void wifiTask(void *) {
   WiFiClient plain;
   char body[512];
   for (;;) {
+    if (!wifiWanted) {  // switched off with the on-screen button
+      if (started) {
+        WiFi.disconnect(true);  // also turns the radio off (saves power and heat)
+        started = false;
+        wifiLastCode = 0;
+      }
+      vTaskDelay(pdMS_TO_TICKS(250));
+      continue;
+    }
+    if (!started) {
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      started = true;
+      lastTry = millis();
+    }
     if (WiFi.status() != WL_CONNECTED) {
       if (millis() - lastTry > 10000) {  // keep trying every 10 s
         WiFi.disconnect();
@@ -845,7 +930,7 @@ void wifiTask(void *) {
 
 // Called once a second from loop(): the latest readings as JSON for the website.
 void queueReading(uint32_t now) {
-  if (!strlen(WIFI_SSID)) return;
+  if (!strlen(WIFI_SSID) || !wifiWanted) return;
   char b[512];
   snprintf(b, sizeof(b),
            "{\"device\":\"%s\",\"motion\":%d,\"tilt\":%.1f,\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,"
@@ -895,6 +980,10 @@ void setup() {
 
   // A name unique to this board, from the chip's factory ID (works before Wi-Fi starts).
   snprintf(deviceId, sizeof(deviceId), "wearable-%06lx", (unsigned long)((ESP.getEfuseMac() >> 24) & 0xFFFFFF));
+  prefs.begin("doseloop", false);
+  wifiWanted = prefs.getBool("wifi", true);
+  touchInit();
+  send(touchOk ? "TOUCH,OK" : "WARN,TOUCH_NOT_FOUND");
   if (strlen(WIFI_SSID)) {
     xTaskCreatePinnedToCore(wifiTask, "wifi", 10240, nullptr, 1, nullptr, 0);
     char b[80];
@@ -1018,10 +1107,23 @@ void loop() {
     queueReading(now);
     char st[200];
     snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,ox_restarts=%u,ox_lost=%lu,reps=%u",
-             !strlen(WIFI_SSID) ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
+             !strlen(WIFI_SSID) || !wifiWanted ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
              mpuOk ? "ok" : "missing", (int)(liveTilt + 0.5f), liveAx, liveAy, liveAz, oxOk ? "ok" : "missing",
              (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, oxRestarts, (unsigned long)oxLost, rd.count);
     send(st);
+  }
+
+  static uint32_t nextTouch = 0;
+  static bool wasTouched = false;
+  if ((int32_t)(now - nextTouch) >= 0) {
+    nextTouch = now + 33;
+    int tx, ty;
+    bool touched = touchRead(tx, ty);
+    if (touched && !wasTouched) {
+      handleTap(tx, ty);
+      nextDraw = now;  // show the change straight away
+    }
+    wasTouched = touched;
   }
 
   if ((int32_t)(now - nextDraw) >= 0) {
