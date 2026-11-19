@@ -243,6 +243,7 @@ struct PulseDetector {
   bool finger = false;   // something is on the sensor AND it has a pulse
   bool contact = false;  // enough light comes back (a finger, or just a reflection)
   bool moving = false;   // light changing but no clear rhythm: movement or pressing
+  bool faint = false;    // something is on the sensor but its pulse is too small to measure
   float quality = 0;     // rhythm strength of the last estimate, 0-1
 
   // State.
@@ -258,7 +259,7 @@ struct PulseDetector {
 
   void reset() {
     bpm = spo2 = 0;
-    finger = contact = moving = false;
+    finger = contact = moving = faint = false;
     quality = 0;
     head = count = sinceEstimate = 0;
     contactT = pulseT = settleT = 0;
@@ -348,7 +349,8 @@ struct PulseDetector {
       blk[nb] = sqrtf(s / 100);
     }
     float typical = median(blk, nb);
-    if (period <= 0 || typical < MIN_PULSE * dcIr) {  // flat: nothing pulsing (or not skin)
+    faint = period > 0 && typical < MIN_PULSE * dcIr;  // usually a finger pressed too hard
+    if (period <= 0 || faint) {  // flat: nothing pulsing (or not skin)
       quality = 0;
       moving = false;
       return false;
@@ -503,7 +505,10 @@ bool oxReg(uint8_t reg, uint8_t &val);
 void oxSetup() {
   oxLastSample = millis();
   if (!(oxOk = ox.begin(Wire, I2C_SPEED_STANDARD))) return;
-  ox.setup(36 /* LED level: about 7 mA. Brighter put fingertips near the sensor's maximum, flattening the pulse */, 4 /* averaging */, 2 /* red + IR */, 400 /* samples/s */, 411 /* pulse width */, 4096 /* range */);
+  // Worn on the wrist (like a watch): the pulse there is 5-10x smaller than at a fingertip, so
+  // the LEDs run brighter (about 16 mA) for a cleaner signal, with the 8192 nA range so the
+  // brighter light does not hit the sensor's maximum.
+  ox.setup(80 /* LED level */, 4 /* averaging */, 2 /* red + IR */, 400 /* samples/s */, 411 /* pulse width */, 8192 /* range */);
   uint8_t clear;
   oxReg(0x00, clear);  // clear the power-up flag, so a later one means a real power dip
 }
@@ -773,7 +778,7 @@ void drawWatch() {
       // steady signal), so people know to keep still rather than lift too soon.
       float prog = (float)(oxTf - pulse.settleT) / 6500.0f;
       prog = prog < 0 ? 0 : prog > 1 ? 1 : prog;
-      centered(pulse.moving ? "Keep still..." : "Measuring... keep still", 194, 1, WARN);
+      centered(pulse.faint && oxTf - pulse.settleT > 6500 ? "Pulse too faint: press lighter" : pulse.moving ? "Keep still..." : "Measuring... keep still", 194, 1, WARN);
       gfx->fillRoundRect(26, 208, 120, 6, 3, TRACK);
       if (prog > 0.02f) gfx->fillRoundRect(26, 208, (int)(120 * prog), 6, 3, ACCENT);
     } else {

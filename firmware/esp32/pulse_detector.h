@@ -31,6 +31,7 @@ struct PulseDetector {
   bool finger = false;   // something is on the sensor AND it has a pulse
   bool contact = false;  // enough light comes back (a finger, or just a reflection)
   bool moving = false;   // light changing but no clear rhythm: movement or pressing
+  bool faint = false;    // something is on the sensor but its pulse is too small to measure
   float quality = 0;     // rhythm strength of the last estimate, 0-1
 
   // State.
@@ -46,7 +47,7 @@ struct PulseDetector {
 
   void reset() {
     bpm = spo2 = 0;
-    finger = contact = moving = false;
+    finger = contact = moving = faint = false;
     quality = 0;
     head = count = sinceEstimate = 0;
     contactT = pulseT = settleT = 0;
@@ -136,7 +137,8 @@ struct PulseDetector {
       blk[nb] = sqrtf(s / 100);
     }
     float typical = median(blk, nb);
-    if (period <= 0 || typical < MIN_PULSE * dcIr) {  // flat: nothing pulsing (or not skin)
+    faint = period > 0 && typical < MIN_PULSE * dcIr;  // usually a finger pressed too hard
+    if (period <= 0 || faint) {  // flat: nothing pulsing (or not skin)
       quality = 0;
       moving = false;
       return false;
