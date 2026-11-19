@@ -419,22 +419,94 @@ bool mpuRead(float &ax, float &ay, float &az) {
 // buffer and fed to the pulse detector with their own timing (10 ms apart), so the screen
 // drawing cannot distort the beat intervals.
 PulseDetector pulse;
-uint32_t oxT = 0;
 uint32_t lastIr = 0, lastRed = 0;  // latest raw readings, for the status line
+uint32_t oxLastSample = 0;          // when the pulse sensor last delivered a reading
+uint16_t oxRestarts = 0;
+bool rawStream = false;  // RAW,1 over USB: print every pulse-sensor reading (for checking the signal)
 
 void oxSetup() {
-  if (!(oxOk = ox.begin(Wire, I2C_SPEED_FAST))) return;
-  ox.setup(60 /* LED level */, 4 /* averaging */, 2 /* red + IR */, 400 /* samples/s */, 411 /* pulse width */, 4096 /* range */);
+  oxLastSample = millis();
+  if (!(oxOk = ox.begin(Wire, I2C_SPEED_STANDARD))) return;
+  ox.setup(36 /* LED level: about 7 mA. Brighter put fingertips near the sensor's maximum, flattening the pulse */, 4 /* averaging */, 2 /* red + IR */, 400 /* samples/s */, 411 /* pulse width */, 4096 /* range */);
+}
+
+// Reads the sensor's own 32-reading buffer directly. (The SparkFun library keeps only 4
+// readings, so whenever the screen is being redrawn some would be overwritten and lost,
+// which throws off the beat timing.) Readings the sensor itself had to drop are counted
+// from its overflow register, so the time between readings stays right.
+#define OX_ADDR 0x57
+uint32_t oxLost = 0;
+// The sensor's clock is not exactly 100 readings a second (this one runs at about 103.5), so
+// the real time between readings is measured and used, keeping heart rate accurate.
+double oxPeriod = 10.0, oxTf = 0;
+uint32_t oxCalStart = 0, oxCalCount = 0;
+
+bool oxReg(uint8_t reg, uint8_t &val) {
+  Wire.beginTransmission(OX_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(OX_ADDR, 1) != 1) return false;
+  val = Wire.read();
+  return true;
+}
+
+void oxSample(uint32_t red, uint32_t ir) {
+  lastIr = ir;
+  lastRed = red;
+  if (!oxCalStart) oxCalStart = millis();
+  if (++oxCalCount >= 500) {  // every ~5 s: readings per millisecond since the last check
+    double p = (double)(millis() - oxCalStart) / oxCalCount;
+    if (p > 8.5 && p < 11.5) oxPeriod = 0.7 * oxPeriod + 0.3 * p;
+    oxCalStart = millis();
+    oxCalCount = 0;
+  }
+  oxTf += oxPeriod;
+  pulse.update(ir, red, (uint32_t)oxTf);
+  if (rawStream) {
+    char r[32];
+    snprintf(r, sizeof(r), "R,%lu,%lu", (unsigned long)ir, (unsigned long)red);
+    send(r);
+  }
 }
 
 void oxPoll() {
   if (!oxOk) return;
-  ox.check();
-  while (ox.available()) {
-    lastIr = ox.getFIFOIR();
-    lastRed = ox.getFIFORed();
-    pulse.update(lastIr, lastRed, oxT += 10);
-    ox.nextSample();
+  // 100 readings a second are expected. None for a second means the connection dropped
+  // (usually a loose SDA/SCL wire): forget the stale reading and restart the sensor.
+  if (millis() - oxLastSample > 1000) {
+    pulse.reset();
+    finger = false;
+    hr = spo2 = 0;
+    lastIr = lastRed = 0;
+    oxRestarts++;
+    send("WARN,MAX30102_RESTART");
+    oxSetup();  // if the sensor does not answer, oxOk goes false and loop() retries every 3 s
+    return;
+  }
+  uint8_t wr, ovf, rp;
+  if (!oxReg(0x04, wr) || !oxReg(0x05, ovf) || !oxReg(0x06, rp)) return;
+  int n = (wr - rp) & 0x1F;
+  ovf &= 0x1F;
+  if (ovf) {  // the buffer filled up and the sensor dropped this many readings
+    n = 32;
+    oxTf += oxPeriod * ovf;
+    oxCalStart = 0;  // readings were dropped: restart the rate measurement
+    oxLost += ovf;
+  }
+  if (!n) return;
+  oxLastSample = millis();
+  Wire.beginTransmission(OX_ADDR);
+  Wire.write(0x07);  // FIFO data: 3 bytes red, then 3 bytes infrared, per reading
+  if (Wire.endTransmission(false) != 0) return;
+  while (n > 0) {
+    int k = n > 5 ? 5 : n;  // 30 bytes at a time fits the I2C buffer
+    if (Wire.requestFrom(OX_ADDR, k * 6) != k * 6) return;
+    for (int i = 0; i < k; i++) {
+      uint32_t red = ((uint32_t)Wire.read() << 16) | ((uint32_t)Wire.read() << 8) | Wire.read();
+      uint32_t ir = ((uint32_t)Wire.read() << 16) | ((uint32_t)Wire.read() << 8) | Wire.read();
+      oxSample(red & 0x3FFFF, ir & 0x3FFFF);
+    }
+    n -= k;
   }
   finger = pulse.finger;
   hr = pulse.bpm;
@@ -459,6 +531,10 @@ void setStop() {
 
 void handleLine(const char *line) {
   unsigned rom, tempo, reps, hrLimit;
+  if (strcmp(line, "RAW,1") == 0 || strcmp(line, "RAW,0") == 0) {  // raw pulse readings on/off
+    rawStream = line[4] == '1';
+    return;
+  }
   if (strncmp(line, "EX,", 3) == 0) {  // exercise name, shown on the screen
     strncpy(exercise, line + 3, sizeof(exercise) - 1);
     exercise[sizeof(exercise) - 1] = 0;
@@ -680,7 +756,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   send("HELLO,DOSELOOP,1");
-  Wire.begin(I2C_SDA, I2C_SCL, 400000);
+  Wire.begin(I2C_SDA, I2C_SCL, 100000);  // 100 kHz: copes better with jumper wires
   // The canvas needs 134 KB of memory; if it cannot get it, draw straight to the screen instead.
   if (canvas->begin()) {
     send("LCD,OK");
@@ -819,10 +895,10 @@ void loop() {
     nextStatus = now + 1000;
     queueReading(now);
     char st[200];
-    snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,reps=%u",
+    snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,ox_restarts=%u,ox_lost=%lu,reps=%u",
              !strlen(WIFI_SSID) ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
              mpuOk ? "ok" : "missing", (int)(liveTilt + 0.5f), liveAx, liveAy, liveAz, oxOk ? "ok" : "missing",
-             (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, rd.count);
+             (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, oxRestarts, (unsigned long)oxLost, rd.count);
     send(st);
   }
 
