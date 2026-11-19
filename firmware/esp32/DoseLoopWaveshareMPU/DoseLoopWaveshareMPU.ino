@@ -696,9 +696,8 @@ void setup() {
   if (!mpuOk) send("WARN,MPU6050_NOT_FOUND");
   if (!oxOk) send("WARN,MAX30102_NOT_FOUND");
 
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  snprintf(deviceId, sizeof(deviceId), "wearable-%02x%02x%02x", mac[3], mac[4], mac[5]);
+  // A name unique to this board, from the chip's factory ID (works before Wi-Fi starts).
+  snprintf(deviceId, sizeof(deviceId), "wearable-%06lx", (unsigned long)((ESP.getEfuseMac() >> 24) & 0xFFFFFF));
   if (strlen(WIFI_SSID)) {
     xTaskCreatePinnedToCore(wifiTask, "wifi", 10240, nullptr, 1, nullptr, 0);
     char b[80];
