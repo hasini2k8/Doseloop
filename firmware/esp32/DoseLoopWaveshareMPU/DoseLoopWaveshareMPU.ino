@@ -745,15 +745,18 @@ void wifiLine(bool withTime) {
 const int BTN_X = 10, BTN_Y = 278, BTN_W = 152, BTN_H = 34;
 
 
-// ---------- continuous pulse screen ----------
-// Opened with the "Measure pulse" button: measures until Stop is tapped, with a live
-// waveform of the pulse signal and how strong it is, and keeps the last good reading on
-// screen (with its age) when the signal drops for a moment.
+// ---------- "Measure pulse" screen (simulated) ----------
+// The wrist pulse from the MAX30102 is too faint to measure reliably, so for demonstrations
+// the "Measure pulse" button runs a simulated measurement: a few seconds of "Measuring...",
+// then a realistic, gently drifting heart rate and oxygen with a live pulse waveform.
+// It is labelled "Simulated" on screen, and the simulated numbers stay on this screen only:
+// they are never sent to the app, the website or anyone's record.
 bool pulseMode = false;
-int lastGoodHr = 0, lastGoodSpo2 = 0;
+uint32_t simStartMs = 0;
+int lastGoodHr = 0, lastGoodSpo2 = 0;  // (real readings, kept for the watch face)
 uint32_t lastGoodMs = 0;
 
-void notePulse() {  // called every frame: remember the latest good reading
+void notePulse() {  // called every frame: remember the latest good real reading
   if (hr) {
     lastGoodHr = hr;
     lastGoodMs = millis();
@@ -761,68 +764,78 @@ void notePulse() {  // called every frame: remember the latest good reading
   if (spo2) lastGoodSpo2 = spo2;
 }
 
+const float SIM_MEASURE_S = 6.5f;  // the "Measuring..." stage
+
+// Simulated heart rate at t seconds: about 74 bpm, drifting slowly (breathing and resting).
+float simBpmAt(float t) {
+  return 74 + 3.5f * sinf(t * 6.2832f / 47) + 1.5f * sinf(t * 6.2832f / 11) + 0.8f * sinf(t * 6.2832f / 4.3f);
+}
+// Pulse wave shape over one beat (phase 0..1): main beat, then the smaller second bump.
+float simWave(float ph) {
+  float a = (ph - 0.18f) / 0.07f, b = (ph - 0.45f) / 0.08f;
+  return expf(-a * a) + 0.45f * expf(-b * b);
+}
+// Beat phase at t seconds (beats counted from the start at the slowly drifting rate).
+float simPhase(float t) {
+  float beats = t * 74 / 60 - 3.5f * 47 / 60 / 6.2832f * (cosf(t * 6.2832f / 47) - 1) - 1.5f * 11 / 60 / 6.2832f * (cosf(t * 6.2832f / 11) - 1);
+  return beats - floorf(beats);
+}
+
 void drawPulse() {
   char buf[48];
-  bool hrHigh = hrMax && hr > hrMax;
   gfx->fillScreen(BG);
   wifiLine(true);
+  float t = (millis() - simStartMs) / 1000.0f;
+  bool measuring = t < SIM_MEASURE_S;
+  int bpm = (int)(simBpmAt(floorf(t)) + 0.5f);  // updates once a second, like the real one
+  int o2 = 98 + (((int)t / 9) % 3 == 0 ? 1 : ((int)t / 7) % 4 == 0 ? -1 : 0);
 
-  // Heart rate: live, or the last good one greyed with its age.
-  bool big = hr && (millis() % (60000UL / hr)) < 180;
-  drawHeart(SW / 2, 44, big ? 10 : 8, hr ? ALERT : TRACK);
-  uint32_t age = (millis() - lastGoodMs) / 1000;
-  if (hr) {
-    snprintf(buf, sizeof(buf), "%d", hr);
-    textC(buf, SW / 2, 124, F_BIG, 2, hrHigh ? ALERT : INK);
-    textC(hrHigh ? "bpm - rest now" : "bpm", SW / 2, 142, F_SMALL, 1, hrHigh ? ALERT : MUTED);
-  } else if (lastGoodHr && age < 120) {
-    snprintf(buf, sizeof(buf), "%d", lastGoodHr);
-    textC(buf, SW / 2, 124, F_BIG, 2, TRACK);
-    snprintf(buf, sizeof(buf), "bpm, %lus ago", (unsigned long)age);
-    textC(buf, SW / 2, 142, F_SMALL, 1, MUTED);
-  } else {
+  // Heart, beating with the simulated pulse.
+  bool beat = !measuring && simPhase(t) < 0.16f;
+  drawHeart(SW / 2, 44, beat ? 10 : 8, measuring ? TRACK : ALERT);
+
+  if (measuring) {
     textC("--", SW / 2, 110, F_BIG, 1, TRACK);
+    centered("Measuring... keep still", 128, 1, WARN);
+    gfx->fillRoundRect(26, 140, 120, 6, 3, TRACK);
+    gfx->fillRoundRect(26, 140, max(6, (int)(120 * t / SIM_MEASURE_S)), 6, 3, ACCENT);
+  } else {
+    snprintf(buf, sizeof(buf), "%d", bpm);
+    textC(buf, SW / 2, 124, F_BIG, 2, INK);
     textC("bpm", SW / 2, 142, F_SMALL, 1, MUTED);
   }
 
-  // Live waveform: the last ~3 s of the filtered infrared signal (peaks are heartbeats).
+  // Live waveform: the last 3 s of the simulated pulse signal, with a little noise.
   card(6, 150, 160, 70);
-  int n = pulse.count < 300 ? pulse.count : 300;
-  if (pulse.contact && n > 20) {
-    float lo = 1e9f, hi = -1e9f;
-    for (int i = 0; i < n; i++) {
-      float v = pulse.x[(pulse.head - n + i + PulseDetector::N) % PulseDetector::N];
-      if (v < lo) lo = v;
-      if (v > hi) hi = v;
-    }
-    float span = hi - lo > 1 ? hi - lo : 1;
-    int px = -1, py = 0;
-    for (int i = 0; i < n; i += 2) {
-      float v = pulse.x[(pulse.head - n + i + PulseDetector::N) % PulseDetector::N];
-      int x = 12 + (int)((long)i * 148 / n), y = 212 - (int)((v - lo) / span * 54);
-      if (px >= 0) gfx->drawLine(px, py, x, y, hr ? ACCENT : MUTED);
-      px = x;
-      py = y;
-    }
-  } else {
-    centered(!oxOk ? "Pulse sensor not found" : !pulse.contact ? "Put the sensor on your skin" : "Starting...", 180, 1, MUTED);
+  gfx->setFont((const GFXfont *)nullptr);
+  gfx->setTextSize(1);
+  gfx->setTextColor(MUTED);
+  gfx->setCursor(104, 155);
+  gfx->print("Simulated");
+  float shown = measuring ? t / SIM_MEASURE_S : 1;  // fades in while measuring
+  int px = -1, py = 0;
+  for (int i = 0; i <= 74; i++) {
+    float tau = t - 3 + i * 3.0f / 74;
+    float v = tau < 0 ? 0 : simWave(simPhase(tau)) + 0.04f * sinf(tau * 37) + 0.03f * sinf(tau * 61 + 1);
+    int x = 12 + i * 2, y = 210 - (int)(v * 44 * shown);
+    if (px >= 0) gfx->drawLine(px, py, x, y, measuring ? MUTED : ACCENT);
+    px = x;
+    py = y;
   }
 
-  // Signal strength (how clearly the pulse repeats) and a hint.
-  float q = pulse.contact ? pulse.quality : 0;
+  // Signal strength: builds up while measuring, then stays strong.
+  float q = measuring ? 0.35f + 0.5f * t / SIM_MEASURE_S : 0.86f + 0.06f * sinf(t * 0.7f);
   textL("Signal", 10, 240, F_SMALL, MUTED);
   gfx->fillRoundRect(64, 231, 98, 8, 4, TRACK);
-  if (q > 0.02f) gfx->fillRoundRect(64, 231, (int)(98 * (q > 1 ? 1 : q)), 8, 4, q >= 0.6f ? GOOD : q >= 0.45f ? ACCENT : WARN);
-  const char *hint = !pulse.contact ? "" : pulse.faint ? "Too faint: snug the strap" : pulse.moving ? "Keep still..." : q >= 0.6f ? "Strong signal" : q >= 0.45f ? "OK signal" : "Weak: hold still";
-  centered(hint, 246, 1, q >= 0.45f ? MUTED : WARN);
+  gfx->fillRoundRect(64, 231, (int)(98 * q), 8, 4, q >= 0.6f ? GOOD : ACCENT);
+  centered(measuring ? "" : "Strong signal", 246, 1, MUTED);
 
   // Oxygen.
   textL("Oxygen", 10, 272, F_SMALL, MUTED);
-  int o2 = spo2 ? spo2 : 0;
-  snprintf(buf, sizeof(buf), o2 ? "%d%%" : "--", o2);
-  textR(buf, 162, 274, F_MED, o2 ? (o2 < 90 ? ALERT : INK) : TRACK);
+  snprintf(buf, sizeof(buf), measuring ? "--" : "%d%%", o2);
+  textR(buf, 162, 274, F_MED, measuring ? TRACK : INK);
 
-  // Stop.
+  // Stop, and the honest label.
   gfx->fillRoundRect(BTN_X, BTN_Y + 6, BTN_W, BTN_H - 6, (BTN_H - 6) / 2, CARD);
   gfx->drawRoundRect(BTN_X, BTN_Y + 6, BTN_W, BTN_H - 6, (BTN_H - 6) / 2, MUTED);
   textC("Stop measuring", SW / 2, BTN_Y + 25, F_SMALLB, 1, INK);
@@ -996,6 +1009,7 @@ void handleTap(int x, int y) {
   if (setActive) return;
   if (y >= BTN_Y - 12) {  // the big bottom button: open or close the pulse screen
     pulseMode = !pulseMode;
+    if (pulseMode) simStartMs = millis();  // start a new simulated measurement
     send(pulseMode ? "PULSE,ON" : "PULSE,OFF");
   }
 }
